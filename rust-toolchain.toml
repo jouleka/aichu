@@ -1,0 +1,7 @@
+# Floating stable matches the MSRV pinned in [workspace.package].rust-version.
+# If you ever need reproducible CI builds, replace "stable" with a specific
+# version (e.g. "1.82") and update the MSRV in Cargo.toml in lockstep.
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

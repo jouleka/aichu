@@ -1,0 +1,32 @@
+# Rust
+/target/
+**/target/
+**/*.rs.bk
+# Cargo.lock IS committed (we ship binaries); only ignore backups.
+Cargo.lock.bak
+
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# macOS
+.DS_Store
+
+# Local env / secrets — never commit these
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.crt
+# Local CA material is per-machine. Public certs are technically shareable,
+# but we treat the whole dir as local-only to avoid accidental commits of
+# private keys.
+ca/
+
+# Experiment outputs / scratch
+experiments/**/out/
+experiments/**/captures/
+experiments/**/results/
+*.log
