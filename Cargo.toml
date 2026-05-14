@@ -26,8 +26,17 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4", features = ["derive"] }
 
 # Experiment-specific
-hudsucker = { version = "0.19", features = ["full", "http2", "rcgen-ca", "rustls-client"] }
+# hudsucker 0.24 uses native async-in-trait (Rust 1.75+), `Issuer` type, and
+# `with_rustls_connector` (renamed from `with_rustls_client`). The build plan
+# at docs/build-plan.md references 0.19 — that doc is archived; this is the
+# version we actually build against.
+# hudsucker re-exports `rcgen` and `rustls` so we use those paths directly
+# instead of pinning duplicates here — that would force version skew with
+# whatever hudsucker selects internally.
+hudsucker = { version = "0.24", features = ["full", "http2", "rcgen-ca", "rustls-client"] }
 axum = "0.7"
 eventsource-stream = "0.2"
 regex = "1.11"
 aho-corasick = "1.1"
+async-trait = "0.1"
+tempfile = "3"

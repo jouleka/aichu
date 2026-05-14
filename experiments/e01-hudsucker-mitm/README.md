@@ -53,4 +53,26 @@ If killed: pivot architecture to Mode A only (no MITM, base-URL relay). See `e02
 
 ## Result
 
-> Not yet run.
+### Automated (`cargo test`)
+
+✅ Five tests passing as of the initial implementation:
+
+- `proxy_relays_sse_stream_and_logs_request` (integration) — a plain-HTTP
+  `GET /sse` routed through aichu reaches the upstream, the SSE body
+  round-trips intact, and `AichuHandler::handle_request` runs exactly once.
+- `ca::first_call_writes_cert_and_key_files` — first call persists the CA.
+- `ca::cert_file_is_a_pem_certificate` — cert is PEM-formatted on disk.
+- `ca::second_call_reuses_existing_ca_without_regenerating` — subsequent
+  calls do **not** mint a new CA (critical: regenerating would invalidate
+  the user's system-store trust install).
+- `ca::key_file_has_owner_only_permissions` (Unix) — key file is mode 0o600.
+
+This proves the **wiring** survives: hudsucker `HttpHandler` runs, the
+proxy relays bodies unmodified, the CA persistence story is correct.
+
+### Manual (Claude Code through HTTPS MITM)
+
+> Not yet run. This is the actual Risk 1 validation — the automated tests
+> cover wiring only, not the HTTPS/cert-pinning question. Until a real
+> `claude` CLI completes a streaming `/v1/messages` call through the
+> proxy, Risk 1 is not validated.
