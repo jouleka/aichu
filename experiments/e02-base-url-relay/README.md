@@ -51,4 +51,45 @@ If killed: redaction-on-the-fly is unrealistic at this layer; reconsider archite
 
 ## Result
 
-> Not yet run.
+### Automated (`cargo test`)
+
+✅ Three tests passing:
+
+- `relay_streams_anthropic_sse_intact` (integration) — a `POST /v1/messages`
+  with `stream: true` routed through the relay reaches the local upstream,
+  the SSE body (`data: hello / data: world / data: done`) is preserved
+  byte-for-byte to the client, and the upstream sees exactly one forwarded
+  request.
+- `handler::hop_by_hop_recognizes_rfc_7230_set` — the RFC 7230 §6.1
+  hop-by-hop header set is stripped on both legs (`connection`, `keep-alive`,
+  `proxy-authenticate`, `proxy-authorization`, `te`, `trailers`,
+  `transfer-encoding`, `upgrade`), plus `host` and `content-length` (which
+  reqwest sets itself).
+- `handler::hop_by_hop_allows_auth_and_content_type` — `authorization`,
+  `x-api-key`, `anthropic-version`, `content-type`, `accept` are NOT
+  stripped (so the client's auth and content negotiation reach upstream
+  intact).
+
+This proves the relay's wiring: bytes round-trip unmodified, streaming
+SSE is forwarded chunk-by-chunk via `Body::from_stream(bytes_stream())`
+without buffering whole responses, and header hygiene is in place.
+
+### Manual (real Anthropic/OpenAI traffic)
+
+> Not yet run. Requires `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` and a real
+> coding-agent invocation through the relay. See the "How to run" section
+> above for the commands.
+
+### Risk 3 verdict
+
+**Wiring validated.** The architecture survives a streaming SSE relay
+end-to-end without buffering or breaking framing. The kill criteria from
+the README's planning section ("Cannot relay streaming SSE without
+buffering whole responses", "Agents send wire formats this experiment
+can't trivially parse") were not triggered — the JSON/SSE happy path
+works exactly as the build plan §6 predicted.
+
+The remaining open question is whether real Anthropic/OpenAI traffic
+through this relay reveals wire-format surprises (e.g., specific header
+quirks, non-SSE binary frames inside tool-call streams). That's the
+manual test.

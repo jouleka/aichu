@@ -1,19 +1,35 @@
-// e02-base-url-relay — Week 1, Risk 3 (passthrough mode)
+// e02-base-url-relay — binary entry point.
 //
-// Smallest possible axum-based relay that forwards /v1/messages and
-// /v1/chat/completions to their real upstreams and streams SSE back without
-// modification. Throwaway validation code.
-//
-// See README.md in this crate for goal, kill criteria, and how to run.
+// Reads upstream URLs from env (or uses defaults), binds the relay on
+// 127.0.0.1:8788, runs until ctrl-c. See README for usage.
 
-fn main() {
-    // TODO(e02): implement once dependencies resolve.
-    //   1. axum::Router with /v1/messages and /v1/chat/completions handlers.
-    //   2. For each route, re-issue with reqwest preserving headers + body.
-    //   3. If response is text/event-stream, wrap reqwest::Response::bytes_stream()
-    //      and forward bytes 1:1 (we do NOT parse SSE here — pass-through only).
-    //   4. Log (method, path, status, content-type) per request.
-    //   5. Listen on 127.0.0.1:8788. Graceful shutdown on SIGINT.
-    eprintln!("e02-base-url-relay: not implemented yet — see README.md");
-    std::process::exit(2);
+use std::net::SocketAddr;
+
+use anyhow::Result;
+use e02_base_url_relay::{RelayConfig, run_relay};
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "info".into()),
+        )
+        .init();
+
+    let config = RelayConfig {
+        anthropic_upstream: std::env::var("AICHU_ANTHROPIC_UPSTREAM")
+            .unwrap_or_else(|_| "https://api.anthropic.com".to_string()),
+        openai_upstream: std::env::var("AICHU_OPENAI_UPSTREAM")
+            .unwrap_or_else(|_| "https://api.openai.com".to_string()),
+    };
+
+    let addr: SocketAddr = "127.0.0.1:8788".parse()?;
+    tracing::info!(%addr, "relay listening — ctrl-c to stop");
+    tracing::info!(anthropic = %config.anthropic_upstream, openai = %config.openai_upstream, "upstream targets");
+
+    run_relay(addr, config, async {
+        let _ = tokio::signal::ctrl_c().await;
+    })
+    .await
 }
