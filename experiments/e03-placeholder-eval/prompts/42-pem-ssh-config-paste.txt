@@ -1,0 +1,11 @@
+SECRET_TEXT=MIIEpAIBAAKCAQEAxxxxxxFakeKeyContentNotARealSecretValuexxxxxxxxxx
+SECRET_TYPE=PEM_KEY
+
+Why doesn't this key work with my Ansible playbook? ssh says "Permissions 0644 for 'deploy.key' are too open":
+
+-----BEGIN RSA PRIVATE KEY-----
+MIIEpAIBAAKCAQEAxxxxxxFakeKeyContentNotARealSecretValuexxxxxxxxxx
+yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy
+-----END RSA PRIVATE KEY-----
+
+I chmod 600'd it. What else affects ssh's "too open" check?

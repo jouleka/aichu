@@ -1,0 +1,8 @@
+SECRET_TEXT=sk_live_fake_StripeTestKeyForDocs
+SECRET_TYPE=STRIPE_KEY
+
+Production webhook handler returns this once a day:
+
+stripe.error.AuthenticationError: Invalid API Key provided: sk_live_***edBR
+
+My env has STRIPE_SECRET_KEY=sk_live_fake_StripeTestKeyForDocs and it works for thousands of other requests. Could there be a race condition with key rotation, or is this likely caching?

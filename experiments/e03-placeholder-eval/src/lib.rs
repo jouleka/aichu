@@ -6,9 +6,12 @@
 // `EvalResult`. The CLI loops over fixtures × formats × models, but the
 // per-cell logic stays in this library so it can be tested without API keys.
 
+pub mod fixtures;
 pub mod model;
 pub mod placeholder;
 pub mod providers;
+
+pub use fixtures::{Fixture, load_fixtures, parse_fixture};
 
 use std::time::Instant;
 

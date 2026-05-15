@@ -1,0 +1,4 @@
+SECRET_TEXT=AKIAIOSFODNN7EXAMPLE
+SECRET_TYPE=AWS_KEY
+
+I rotated AKIAIOSFODNN7EXAMPLE last week. CloudTrail still shows it being used by a session named "legacy-deploy-prod" once an hour. How do I find what's still calling sts:GetSessionToken with the old credential?

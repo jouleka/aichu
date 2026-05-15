@@ -1,0 +1,11 @@
+SECRET_TEXT=sk-proj-fake-1234567890abcdefghijklmnopqrstuvwxyz
+SECRET_TYPE=OPENAI_KEY
+
+Translate this curl into Go using openai-go:
+
+curl https://api.openai.com/v1/chat/completions \
+  -H "Authorization: Bearer sk-proj-fake-1234567890abcdefghijklmnopqrstuvwxyz" \
+  -H "Content-Type: application/json" \
+  -d '{"model": "gpt-4o-mini", "messages": [{"role": "user", "content": "hi"}]}'
+
+I want streaming and proper error handling.

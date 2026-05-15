@@ -1,0 +1,10 @@
+SECRET_TEXT=AKIAIOSFODNN7EXAMPLE
+SECRET_TYPE=AWS_KEY
+
+My S3 upload is returning 403 Forbidden. Here's the relevant part of my .env:
+
+AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE
+AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
+AWS_REGION=us-east-1
+
+The bucket name is correct and I can list it from `aws s3 ls`. What could be wrong with the policy?

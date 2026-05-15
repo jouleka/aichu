@@ -1,0 +1,11 @@
+SECRET_TEXT=ghp_FakeTestPATForRedactionEvalExamples123456
+SECRET_TYPE=GITHUB_PAT
+
+Workflow review:
+
+- name: Publish release
+  env:
+    GITHUB_TOKEN: ghp_FakeTestPATForRedactionEvalExamples123456
+  run: gh release create v1.0.0 dist/*.zip
+
+I know I should use ${{ secrets.GITHUB_TOKEN }} but the default token can't push to a different repo in the same org. How do I scope a PAT properly without committing it?

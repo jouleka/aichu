@@ -1,0 +1,15 @@
+SECRET_TEXT=AKIAIOSFODNN7EXAMPLE
+SECRET_TYPE=AWS_KEY
+
+Debug an IAM policy with me. My access key AKIAIOSFODNN7EXAMPLE is attached to an IAM user with this policy:
+
+{
+    "Version": "2012-10-17",
+    "Statement": [{
+        "Effect": "Allow",
+        "Action": ["s3:GetObject"],
+        "Resource": "arn:aws:s3:::my-bucket/*"
+    }]
+}
+
+But `aws s3 cp s3://my-bucket/file.txt .` returns 403. Bucket policy is empty. Why is the request being denied?

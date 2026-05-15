@@ -1,0 +1,10 @@
+SECRET_TEXT=xoxb-FAKE-EXAMPLE-DO-NOT-USE-token-for-redaction-eval
+SECRET_TYPE=SLACK_TOKEN
+
+My .env:
+
+SLACK_BOT_TOKEN=xoxb-FAKE-EXAMPLE-DO-NOT-USE-token-for-redaction-eval
+SLACK_SIGNING_SECRET=fake-signing-secret-for-redaction-eval-only
+PORT=3000
+
+The bot connects via Socket Mode but chat.postMessage returns 'not_authed'. The bot is in the channel and has chat:write. Where do I look next?

@@ -1,0 +1,8 @@
+SECRET_TEXT=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIiwiaWF0IjoxNTE2MjM5MDIyfQ.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c
+SECRET_TYPE=JWT
+
+import jwt
+token = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIiwiaWF0IjoxNTE2MjM5MDIyfQ.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c"
+print(jwt.decode(token, options={"verify_signature": False}))
+
+I know this is dangerous but I need to inspect a JWT from a third-party system to debug an audience-mismatch issue. What's a safe pattern that still lets me read claims for diagnostics?

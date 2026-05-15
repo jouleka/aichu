@@ -1,0 +1,9 @@
+SECRET_TEXT=redis-fake-password-for-tests-only
+SECRET_TYPE=DATABASE_URL
+
+My .env:
+
+REDIS_URL=redis://default:redis-fake-password-for-tests-only@redis.svc.cluster.local:6379/0
+SESSION_TTL=3600
+
+Intermittent "NOAUTH Authentication required" appears every few hours. Could ioredis be reconnecting without sending AUTH first? What's the right config?

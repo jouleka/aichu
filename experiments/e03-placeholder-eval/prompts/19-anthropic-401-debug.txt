@@ -1,0 +1,8 @@
+SECRET_TEXT=sk-ant-api03-fake-keyForDocumentationOnly
+SECRET_TYPE=ANTHROPIC_KEY
+
+Debugging this in production:
+
+anthropic.AuthenticationError: Error code: 401 - {"type": "error", "error": {"type": "authentication_error", "message": "invalid x-api-key"}}
+
+My key sk-ant-api03-fake-keyForDocumentationOnly is set in env, I tested it locally last week and it worked. Did Anthropic deprecate a header format?

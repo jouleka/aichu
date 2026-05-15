@@ -1,0 +1,14 @@
+SECRET_TEXT=sk-ant-api03-fake-keyForDocumentationOnly
+SECRET_TYPE=ANTHROPIC_KEY
+
+I have a fallback path in my service:
+
+# direct
+api_key = "sk-ant-api03-fake-keyForDocumentationOnly"
+client = anthropic.Anthropic(api_key=api_key)
+
+# bedrock fallback
+import boto3
+bedrock = boto3.client("bedrock-runtime")
+
+How should I decide which path to take at runtime, and what's the cleanest abstraction so callers don't care?

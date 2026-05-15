@@ -1,0 +1,19 @@
+SECRET_TEXT=sk_live_fake_StripeTestKeyForDocs
+SECRET_TYPE=STRIPE_KEY
+
+Code review:
+
+import stripe
+stripe.api_key = "sk_live_fake_StripeTestKeyForDocs"
+
+@app.post("/stripe-webhook")
+def webhook(request):
+    event = stripe.Webhook.construct_event(
+        payload=request.body,
+        sig_header=request.headers["stripe-signature"],
+        secret="whsec_test_fake_webhook_secret",
+    )
+    if event.type == "payment_intent.succeeded":
+        record_payment(event.data.object)
+
+Two questions: (a) move api_key to env, (b) what's the right way to handle signature verification failure? Right now it 500s.

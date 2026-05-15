@@ -1,0 +1,11 @@
+SECRET_TEXT=sk-proj-fake-1234567890abcdefghijklmnopqrstuvwxyz
+SECRET_TYPE=OPENAI_KEY
+
+Quick review of my .env — does it have anything obviously wrong before I gitignore it?
+
+NODE_ENV=development
+PORT=3000
+OPENAI_API_KEY=sk-proj-fake-1234567890abcdefghijklmnopqrstuvwxyz
+ANTHROPIC_API_KEY=sk-ant-api03-fake-keyForDocumentationOnly
+DATABASE_URL=postgres://app:s3cr3t@localhost:5432/app_dev
+SENTRY_DSN=https://abc123@example.ingest.sentry.io/12345

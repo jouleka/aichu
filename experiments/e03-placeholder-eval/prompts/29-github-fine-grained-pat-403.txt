@@ -1,0 +1,4 @@
+SECRET_TEXT=github_pat_11AAAAAAQ0FakeFineGrainedTokenForEvalABCDEFGHIJKLMNOPQR
+SECRET_TYPE=GITHUB_PAT
+
+My fine-grained PAT github_pat_11AAAAAAQ0FakeFineGrainedTokenForEvalABCDEFGHIJKLMNOPQR has Contents:Read on two repos according to the settings UI. But `gh api repos/myorg/repo1/contents/README.md` returns 403. How do I introspect what scopes a fine-grained PAT actually has at runtime?

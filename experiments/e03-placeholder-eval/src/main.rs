@@ -12,11 +12,12 @@
 use std::fs;
 use std::path::PathBuf;
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result};
 use clap::Parser;
 
 use e03_placeholder_eval::{
-    PlaceholderFormat, evaluate, model::Model, providers::anthropic::AnthropicProvider,
+    PlaceholderFormat, evaluate, load_fixtures, model::Model,
+    providers::anthropic::AnthropicProvider,
 };
 
 #[derive(Debug, Parser)]
@@ -102,78 +103,4 @@ fn parse_formats(s: &str) -> Result<Vec<PlaceholderFormat>> {
         return Ok(PlaceholderFormat::all().to_vec());
     }
     s.split(',').map(|p| p.trim().parse()).collect()
-}
-
-struct Fixture {
-    name: String,
-    secret_text: String,
-    secret_type: String,
-    text: String,
-}
-
-fn load_fixtures(dir: &std::path::Path) -> Result<Vec<Fixture>> {
-    let mut out = Vec::new();
-    for entry in fs::read_dir(dir).with_context(|| format!("read_dir {}", dir.display()))? {
-        let entry = entry?;
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("txt") {
-            continue;
-        }
-        let name = path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .ok_or_else(|| anyhow!("non-utf8 fixture name: {}", path.display()))?
-            .to_string();
-        let raw = fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
-        let fixture = parse_fixture(&name, &raw)
-            .with_context(|| format!("parse fixture {}", path.display()))?;
-        out.push(fixture);
-    }
-    out.sort_by(|a, b| a.name.cmp(&b.name));
-    Ok(out)
-}
-
-fn parse_fixture(name: &str, raw: &str) -> Result<Fixture> {
-    let mut secret_text = None;
-    let mut secret_type = None;
-    let mut body_lines = Vec::new();
-    let mut in_body = false;
-
-    for line in raw.lines() {
-        if !in_body {
-            if let Some(rest) = line.strip_prefix("SECRET_TEXT=") {
-                secret_text = Some(rest.to_string());
-                continue;
-            }
-            if let Some(rest) = line.strip_prefix("SECRET_TYPE=") {
-                secret_type = Some(rest.to_string());
-                continue;
-            }
-            if line.trim().is_empty() {
-                in_body = true;
-                continue;
-            }
-            // A non-blank, non-header line means we're in the body.
-            in_body = true;
-        }
-        body_lines.push(line);
-    }
-
-    let secret_text = secret_text.ok_or_else(|| anyhow!("missing SECRET_TEXT= header"))?;
-    let secret_type = secret_type.ok_or_else(|| anyhow!("missing SECRET_TYPE= header"))?;
-    let text = body_lines.join("\n");
-
-    if !text.contains(&secret_text) {
-        anyhow::bail!(
-            "fixture body does not contain SECRET_TEXT={secret_text:?}; \
-             the substitution would be a no-op"
-        );
-    }
-
-    Ok(Fixture {
-        name: name.to_string(),
-        secret_text,
-        secret_type,
-        text,
-    })
 }

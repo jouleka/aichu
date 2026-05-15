@@ -1,0 +1,11 @@
+SECRET_TEXT=sk-proj-fake-1234567890abcdefghijklmnopqrstuvwxyz
+SECRET_TYPE=OPENAI_KEY
+
+My Jupyter notebook has this in cell 1:
+
+import openai
+openai.api_key = "sk-proj-fake-1234567890abcdefghijklmnopqrstuvwxyz"
+print(openai.api_key)  # debugging
+client = openai.OpenAI()
+
+When I save the .ipynb, the printed key ends up in cell output too. How do I sanitize before pushing the notebook to a public repo?

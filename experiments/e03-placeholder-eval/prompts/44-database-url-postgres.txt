@@ -1,0 +1,8 @@
+SECRET_TEXT=s3cr3t-postgres-test-password-do-not-use
+SECRET_TYPE=DATABASE_URL
+
+My app fails to connect after the latest deploy:
+
+DATABASE_URL=postgres://app:s3cr3t-postgres-test-password-do-not-use@db.internal.example.com:5432/app_prod?sslmode=require
+
+Traceback shows "FATAL: password authentication failed for user app". I just rotated the password but the deployment seems to be using the old cached value. How do I roll the deploy in Kubernetes without downtime?

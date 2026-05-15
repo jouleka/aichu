@@ -1,0 +1,10 @@
+SECRET_TEXT=internal-svc-token-fakeForRedactionEvalTestingExample
+SECRET_TYPE=GENERIC
+
+Our internal billing service auths with a static X-Internal-Token header:
+
+headers = {"X-Internal-Token": "internal-svc-token-fakeForRedactionEvalTestingExample"}
+r = requests.get("https://billing.internal.example.com/api/v1/accounts/me", headers=headers)
+r.raise_for_status()
+
+I want to migrate to short-lived tokens fetched from our auth service. Sketch the refactor.

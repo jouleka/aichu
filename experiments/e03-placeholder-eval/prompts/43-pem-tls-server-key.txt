@@ -1,0 +1,18 @@
+SECRET_TEXT=MIIEpAIBAAKCAQEAxxxxxxFakeKeyContentNotARealSecretValuexxxxxxxxxx
+SECRET_TYPE=PEM_KEY
+
+My nginx server-block has:
+
+server {
+    listen 443 ssl;
+    ssl_certificate     /etc/nginx/certs/example.crt;
+    ssl_certificate_key /etc/nginx/certs/example.key;
+}
+
+And example.key contains:
+
+-----BEGIN PRIVATE KEY-----
+MIIEpAIBAAKCAQEAxxxxxxFakeKeyContentNotARealSecretValuexxxxxxxxxx
+-----END PRIVATE KEY-----
+
+nginx -t says "PEM_read_bio_PrivateKey() failed". Is it because of the PKCS#8 vs PKCS#1 difference?

@@ -1,0 +1,13 @@
+SECRET_TEXT=AKIAIOSFODNN7EXAMPLE
+SECRET_TYPE=AWS_KEY
+
+My SageMaker notebook needs to access an external S3 bucket in a different account. Cell 2:
+
+import os
+os.environ["AWS_ACCESS_KEY_ID"] = "AKIAIOSFODNN7EXAMPLE"
+os.environ["AWS_SECRET_ACCESS_KEY"] = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+import boto3
+client = boto3.client("s3")
+client.list_objects_v2(Bucket="external-vendor-bucket")
+
+Is there a better way using cross-account IAM roles?

@@ -1,0 +1,8 @@
+SECRET_TEXT=mongo-test-password-do-not-use-in-real-prod
+SECRET_TYPE=DATABASE_URL
+
+Convert this from a URI to an explicit options object I can checkpoint in source:
+
+mongodb+srv://app:mongo-test-password-do-not-use-in-real-prod@cluster0.mongodb.net/myapp?retryWrites=true&w=majority
+
+I'm using mongoose 8.x. Want the password to come from process.env and the rest to be hardcoded options.

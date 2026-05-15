@@ -1,0 +1,8 @@
+SECRET_TEXT=sk-proj-fake-1234567890abcdefghijklmnopqrstuvwxyz
+SECRET_TYPE=OPENAI_KEY
+
+Getting 401 from openai-python:
+
+openai.AuthenticationError: Error code: 401 - {'error': {'message': 'Incorrect API key provided: sk-pr...wxyz. You can find your API key at https://platform.openai.com/account/api-keys.', 'type': 'invalid_request_error'}}
+
+My env has OPENAI_API_KEY=sk-proj-fake-1234567890abcdefghijklmnopqrstuvwxyz. The org has multiple projects — could I be hitting the wrong one?

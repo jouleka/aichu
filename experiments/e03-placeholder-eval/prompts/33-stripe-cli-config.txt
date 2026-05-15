@@ -1,0 +1,10 @@
+SECRET_TEXT=sk_live_fake_StripeTestKeyForDocs
+SECRET_TYPE=STRIPE_KEY
+
+My .stripe/config.toml:
+
+[default]
+test_mode_api_key = "sk_test_fake_StripePlaygroundKey"
+live_mode_api_key = "sk_live_fake_StripeTestKeyForDocs"
+
+`stripe customers list --live` returns 401. The dashboard shows the key is active. What's the right way to debug this with `stripe logs tail`?

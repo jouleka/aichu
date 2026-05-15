@@ -1,0 +1,12 @@
+SECRET_TEXT=MIIEpAIBAAKCAQEAxxxxxxFakeKeyContentNotARealSecretValuexxxxxxxxxx
+SECRET_TYPE=PEM_KEY
+
+I accidentally committed this id_rsa to a public repo:
+
+-----BEGIN RSA PRIVATE KEY-----
+MIIEpAIBAAKCAQEAxxxxxxFakeKeyContentNotARealSecretValuexxxxxxxxxx
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+-----END RSA PRIVATE KEY-----
+
+I've already revoked it on the servers it was deployed to. What's the right way to scrub it from git history? Is `git filter-repo` enough or do I need to nuke and re-clone?

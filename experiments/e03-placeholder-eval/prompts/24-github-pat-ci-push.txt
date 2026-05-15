@@ -1,0 +1,4 @@
+SECRET_TEXT=ghp_FakeTestPATForRedactionEvalExamples123456
+SECRET_TYPE=GITHUB_PAT
+
+My .env has GITHUB_TOKEN=ghp_FakeTestPATForRedactionEvalExamples123456 and works locally. CI can't push tags though — fails with "Permission denied". The PAT has repo + workflow scopes. What else does it need?

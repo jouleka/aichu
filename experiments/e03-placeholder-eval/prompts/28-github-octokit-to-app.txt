@@ -1,0 +1,14 @@
+SECRET_TEXT=ghp_FakeTestPATForRedactionEvalExamples123456
+SECRET_TYPE=GITHUB_PAT
+
+import { Octokit } from "@octokit/rest";
+const octokit = new Octokit({
+    auth: "ghp_FakeTestPATForRedactionEvalExamples123456",
+});
+await octokit.rest.issues.create({
+    owner: "me",
+    repo: "myrepo",
+    title: "test",
+});
+
+How do I switch this to a GitHub App with installation tokens? I want the bot to show up as an App rather than as my user.

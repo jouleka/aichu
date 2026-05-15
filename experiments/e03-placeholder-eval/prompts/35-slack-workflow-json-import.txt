@@ -1,0 +1,17 @@
+SECRET_TEXT=xoxb-FAKE-EXAMPLE-DO-NOT-USE-token-for-redaction-eval
+SECRET_TYPE=SLACK_TOKEN
+
+Reviewing this n8n workflow JSON before I import it into our shared instance:
+
+{
+    "nodes": [{
+        "name": "Slack",
+        "credentials": {
+            "slackOAuth2Api": {
+                "accessToken": "xoxb-FAKE-EXAMPLE-DO-NOT-USE-token-for-redaction-eval"
+            }
+        }
+    }]
+}
+
+Should the token be inline, or referenced from n8n's credential store? What's the right way to share workflows with the team?

@@ -1,0 +1,8 @@
+SECRET_TEXT=fakeKeyIdForEvalTestingOnly
+SECRET_TYPE=GCP_SA_JSON
+
+GOOGLE_APPLICATION_CREDENTIALS=/var/secrets/sa.json points to a JSON whose private_key_id is "fakeKeyIdForEvalTestingOnly". The file exists and is readable by the app user, but the Python google-cloud-storage SDK still errors:
+
+google.auth.exceptions.DefaultCredentialsError: Could not automatically determine credentials
+
+What's the order of credential sources GCP libs try, and how do I force them to use only the file?

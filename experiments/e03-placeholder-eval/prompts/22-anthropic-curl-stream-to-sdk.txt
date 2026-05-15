@@ -1,0 +1,12 @@
+SECRET_TEXT=sk-ant-api03-fake-keyForDocumentationOnly
+SECRET_TYPE=ANTHROPIC_KEY
+
+Convert this curl into a Node.js streaming call using @anthropic-ai/sdk:
+
+curl https://api.anthropic.com/v1/messages \
+  -H "x-api-key: sk-ant-api03-fake-keyForDocumentationOnly" \
+  -H "anthropic-version: 2023-06-01" \
+  -H "content-type: application/json" \
+  -d '{"model": "claude-opus-4-7-20250514", "max_tokens": 200, "stream": true, "messages": [{"role": "user", "content": "haiku about Rust"}]}'
+
+I want the SDK with proper async iteration over content_block_delta events.

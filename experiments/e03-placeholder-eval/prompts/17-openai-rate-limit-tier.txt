@@ -1,0 +1,4 @@
+SECRET_TEXT=sk-proj-fake-1234567890abcdefghijklmnopqrstuvwxyz
+SECRET_TYPE=OPENAI_KEY
+
+I'm getting RateLimitError with key sk-proj-fake-1234567890abcdefghijklmnopqrstuvwxyz on requests-per-minute. The error message says I'm at tier 1 but my dashboard shows tier 3. Is there a way to check my current tier programmatically via the API rather than the web UI?

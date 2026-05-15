@@ -1,0 +1,15 @@
+SECRET_TEXT=sk-ant-api03-fake-keyForDocumentationOnly
+SECRET_TYPE=ANTHROPIC_KEY
+
+Code review for my anthropic-python call:
+
+import anthropic
+client = anthropic.Anthropic(api_key="sk-ant-api03-fake-keyForDocumentationOnly")
+message = client.messages.create(
+    model="claude-opus-4-7-20250514",
+    max_tokens=1024,
+    messages=[{"role": "user", "content": "hello"}],
+)
+print(message.content[0].text)
+
+Should I switch to ANTHROPIC_API_KEY from environment, and if so what's the idiomatic pattern in 2026?

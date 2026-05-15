@@ -1,0 +1,11 @@
+SECRET_TEXT=AKIAIOSFODNN7EXAMPLE
+SECRET_TYPE=AWS_KEY
+
+I'm getting Access Denied from my Lambda function on S3 reads. The function's environment variables are:
+
+DB_HOST=db.internal.example.com
+DB_USER=app
+AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE
+LOG_LEVEL=DEBUG
+
+The Lambda's execution role already has s3:GetObject. Should I remove the env var entirely?

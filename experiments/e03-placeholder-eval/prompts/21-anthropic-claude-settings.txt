@@ -1,0 +1,13 @@
+SECRET_TEXT=sk-ant-api03-fake-keyForDocumentationOnly
+SECRET_TYPE=ANTHROPIC_KEY
+
+My ~/.claude/settings.json has:
+
+{
+    "env": {
+        "ANTHROPIC_API_KEY": "sk-ant-api03-fake-keyForDocumentationOnly",
+        "ANTHROPIC_BASE_URL": "https://api.anthropic.com"
+    }
+}
+
+Is this the right place for the key, or should it be a shell env var that Claude Code inherits? What's the security trade-off?

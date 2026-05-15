@@ -1,0 +1,13 @@
+SECRET_TEXT=sk-ant-api03-fake-keyForDocumentationOnly
+SECRET_TYPE=ANTHROPIC_KEY
+
+Audit my .env for me:
+
+NODE_ENV=production
+ANTHROPIC_API_KEY=sk-ant-api03-fake-keyForDocumentationOnly
+CLAUDE_CODE_USE_BEDROCK=0
+STRIPE_SECRET_KEY=sk_live_fake_StripeTestKeyForDocs
+REDIS_URL=redis://default:redispassword123@redis:6379/0
+GITHUB_TOKEN=ghp_FakeTestPATForRedactionEvalExamples123456
+
+What should be in here vs in a secret manager?
