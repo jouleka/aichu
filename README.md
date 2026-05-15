@@ -59,6 +59,23 @@ Once risks are validated (or killed), the production layout will look roughly li
 
 Any experiment whose risk was killed disappears from the architecture.
 
+## v0 scope: CLI tools only
+
+Validated empirically against six real coding-agent surfaces (see
+[e01 README → Manual smoke test](experiments/e01-hudsucker-mitm/README.md#manual-smoke-test-2026-05-15)),
+aichu v0 ships for:
+
+- **Claude Code CLI** — `HTTPS_PROXY` + `NODE_EXTRA_CA_CERTS`
+- **Codex CLI** — same env vars, or `[model_providers]` in `~/.codex/config.toml`
+- **OpenCode** (Bun) — same env vars
+- **Cursor CLI** (`cursor-agent`) — same env vars (requires `cursor-agent login`)
+
+**Out of scope for v0:** Cursor IDE and Claude Desktop. Both put their chat
+path in Chromium's network service, which on macOS doesn't read `HTTPS_PROXY`
+and routes chat traffic via a separate process holding direct TCP
+connections. Reaching them requires Mode C / transparent capture (eBPF on
+Linux, macOS Network Extension) — a future investment, not a v0 feature.
+
 ## License
 
 Dual-licensed under MIT or Apache 2.0, at your option.
