@@ -611,11 +611,13 @@ name = "e03-placeholder-eval"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "async-trait",
+ "axum",
  "clap",
- "futures-util",
  "reqwest",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",
