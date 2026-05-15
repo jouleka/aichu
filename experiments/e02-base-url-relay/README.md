@@ -74,11 +74,63 @@ This proves the relay's wiring: bytes round-trip unmodified, streaming
 SSE is forwarded chunk-by-chunk via `Body::from_stream(bytes_stream())`
 without buffering whole responses, and header hygiene is in place.
 
-### Manual (real Anthropic/OpenAI traffic)
+### Manual (real Anthropic traffic, 2026-05-15)
 
-> Not yet run. Requires `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` and a real
-> coding-agent invocation through the relay. See the "How to run" section
-> above for the commands.
+Setup: `cargo run --release -p e02-base-url-relay` with default upstreams
+(`https://api.anthropic.com`, `https://api.openai.com`). Two checks:
+
+**1. Real `claude` invocation → real model response through the relay.**
+
+```bash
+ANTHROPIC_BASE_URL=http://127.0.0.1:8788 \
+  claude -p "Reply with only the single word PONG and nothing else." \
+         --output-format text
+```
+
+Output: `PONG`. Claude Code talks plain HTTP to localhost; relay re-issues
+over HTTPS to real Anthropic; auth, streaming, content-type, and body all
+round-trip without modification.
+
+**2. Curl with a deliberately-invalid key → real Anthropic 401.**
+
+```bash
+curl -X POST http://127.0.0.1:8788/v1/messages \
+     -H "Content-Type: application/json" \
+     -H "x-api-key: sk-ant-deliberately-invalid" \
+     -H "anthropic-version: 2023-06-01" \
+     -d '{"model":"claude-opus-4-7",
+          "messages":[{"role":"user","content":"hi"}],
+          "max_tokens":10}'
+```
+
+Response: `HTTP 401`, body `{"type":"error","error":{"type":"authentication_error","message":"invalid x-api-key"},"request_id":"req_011Cb45iXCZAUxKSLEzHtvgq"}`.
+
+The `request_id: req_011...` is Anthropic's own format — proof the relay
+actually reached `api.anthropic.com` and propagated the upstream response
+verbatim. (If the relay had short-circuited or fabricated the 401, no
+real `request_id` would appear.)
+
+### Risk 3 verdict
+
+**Fully validated** for the Anthropic path. The Mode A architecture
+survives real coding-agent traffic with zero CA install: a plain-HTTP
+localhost endpoint that re-issues over HTTPS to upstream, preserving
+streaming, auth, and error semantics.
+
+The OpenAI path was structurally tested in the integration test
+(`relay_streams_openai_chat_completions_chunks_over_time`) but not yet
+exercised against real `api.openai.com` — that's a follow-up requiring
+an `OPENAI_API_KEY`. Codex CLI's `[model_providers]` config path is the
+intended production wiring; this experiment proves the relay does its
+side correctly.
+
+### Follow-ups identified during the smoke test
+
+- The relay currently has **no per-request tracing** in the handler — only
+  startup logs appear. Production `crates/proxy-server` should add a
+  `tower-http::trace::TraceLayer` or an explicit `tracing::info!` at
+  forward time so operators can see what's being relayed. Not blocking
+  for this experiment but flagged for the production crate.
 
 ### Risk 3 verdict
 
