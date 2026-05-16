@@ -1,15 +1,15 @@
-// Secret-pattern rules for v0.
+// Secret-pattern rules.
 //
-// We ship five PREFIX-TYPED patterns from build-plan §3. These are
+// We ship PREFIX-TYPED patterns from build-plan §3. These are
 // unambiguous (Anthropic, OpenAI, AWS access key, GitHub PAT, Stripe
-// live key) — patterns where the FALSE-POSITIVE rate on real text is
-// effectively zero because the prefix is distinctive and the rest of
-// the pattern is shape-constrained.
+// live key, JWT, Slack token) — patterns where the FALSE-POSITIVE rate
+// on real text is low because the prefix is distinctive and the rest
+// of the pattern is shape-constrained.
 //
-// The four follow-up rules build-plan §3 names (AWS_SECRET, Slack
-// token, JWT, PEM) are deliberately deferred to a Phase-2 commit. They
-// either require an entropy gate (AWS_SECRET, JWT) or a multi-line
-// match (PEM), neither of which is in v0.
+// Still deferred: AWS_SECRET (no distinctive prefix; needs entropy
+// gate + identifier-proximity check to avoid false positives on bare
+// 40-char base64-ish strings) and PEM blocks (multi-line, requires
+// scanning across newlines).
 
 use std::fmt;
 
@@ -20,6 +20,14 @@ pub enum SecretKind {
     AwsAccessKey,
     GithubPat,
     StripeLiveKey,
+    /// JSON Web Tokens (`eyJ...eyJ...sig` three-segment base64url).
+    /// Distinctive shape; the `eyJ` prefix is the base64 of `{"a`
+    /// which begins almost every JWT header.
+    Jwt,
+    /// Slack tokens — `xoxb-` (bot), `xoxa-` (workspace app legacy),
+    /// `xoxp-` (user), `xoxr-` (refresh) prefixes followed by
+    /// team/user/secret segments.
+    SlackToken,
 }
 
 impl SecretKind {
@@ -32,6 +40,8 @@ impl SecretKind {
         SecretKind::AwsAccessKey,
         SecretKind::GithubPat,
         SecretKind::StripeLiveKey,
+        SecretKind::Jwt,
+        SecretKind::SlackToken,
     ];
 
     /// Keywords the aho-corasick pre-filter scans for. If `input` does
@@ -53,6 +63,9 @@ impl SecretKind {
             SecretKind::AwsAccessKey => &["AKIA", "ASIA"],
             SecretKind::GithubPat => &["ghp_", "github_pat_"],
             SecretKind::StripeLiveKey => &["sk_live_"],
+            // "eyJ" = base64("{\"a"), how every JWT header starts.
+            SecretKind::Jwt => &["eyJ"],
+            SecretKind::SlackToken => &["xoxb-", "xoxa-", "xoxp-", "xoxr-"],
         }
     }
 
@@ -78,6 +91,20 @@ impl SecretKind {
             // Stripe live secret keys. Test keys (sk_test_) are NOT
             // matched — they're not credentials worth redacting.
             SecretKind::StripeLiveKey => r"sk_live_[A-Za-z0-9]{24,}",
+            // JWT: three base64url segments separated by dots. Each
+            // header/payload segment starts with `eyJ`. Minimum
+            // lengths filter accidental three-dot sequences.
+            SecretKind::Jwt => {
+                r"eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{20,}"
+            }
+            // Slack: `xox[abpr]-` followed by team/user/secret segments
+            // separated by dashes. Real tokens have digit-only ID
+            // segments and a fixed length; the build-plan §3 spec is
+            // 10-48 chars after the prefix. We use 10-200 (a bit looser
+            // upper bound for safety) so the greedy match stops before
+            // engulfing surrounding kebab-case prose like
+            // `xoxb-foo-bar-baz then more=value`.
+            SecretKind::SlackToken => r"xox[abpr]-[A-Za-z0-9-]{10,200}",
         }
     }
 
@@ -91,6 +118,8 @@ impl SecretKind {
             SecretKind::AwsAccessKey => "AWS_KEY",
             SecretKind::GithubPat => "GITHUB_PAT",
             SecretKind::StripeLiveKey => "STRIPE_KEY",
+            SecretKind::Jwt => "JWT",
+            SecretKind::SlackToken => "SLACK_TOKEN",
         }
     }
 }
@@ -151,6 +180,24 @@ mod tests {
             (
                 SecretKind::StripeLiveKey,
                 &[format!("sk_live_{}", "a".repeat(24))],
+            ),
+            (
+                SecretKind::Jwt,
+                &[format!(
+                    "eyJ{}.eyJ{}.{}",
+                    "a".repeat(10),
+                    "a".repeat(10),
+                    "a".repeat(20),
+                )],
+            ),
+            (
+                SecretKind::SlackToken,
+                &[
+                    format!("xoxb-{}", "a".repeat(10)),
+                    format!("xoxp-{}", "a".repeat(10)),
+                    format!("xoxa-{}", "a".repeat(10)),
+                    format!("xoxr-{}", "a".repeat(10)),
+                ],
             ),
         ];
         for (kind, samples) in samples_per_kind {

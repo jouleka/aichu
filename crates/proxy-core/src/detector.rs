@@ -211,6 +211,45 @@ mod tests {
     }
 
     #[test]
+    fn detects_jwt_three_segment_token() {
+        // jwt.io's canonical example. Three base64url segments
+        // separated by dots, each starting with "eyJ" for the first
+        // two (header + payload).
+        let jwt = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.\
+                   eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIiwiaWF0IjoxNTE2MjM5MDIyfQ.\
+                   SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c";
+        let s = format!("Authorization: Bearer {jwt}");
+        let f = scan(&s);
+        assert_eq!(kinds(&f), vec![SecretKind::Jwt]);
+        assert_eq!(f[0].text, jwt);
+    }
+
+    #[test]
+    fn detects_slack_bot_token() {
+        // Test fixtures use kebab-case fake values, not the
+        // `xox[bpar]-DIGITS-DIGITS-CHARS` real-token shape, because
+        // GitHub's push-protection scanner flags any commit
+        // containing a real-shaped Slack token even in test
+        // fixtures (we hit this on the e03 corpus). The regex still
+        // matches because `xox[abpr]-[A-Za-z0-9-]{10,200}` accepts
+        // any 10-200 char alphanumeric-dash sequence after the
+        // prefix.
+        let s = "SLACK_BOT_TOKEN=xoxb-FAKE-EXAMPLE-DO-NOT-USE-token-for-eval in env";
+        let f = scan(s);
+        assert_eq!(kinds(&f), vec![SecretKind::SlackToken]);
+        assert!(f[0].text.starts_with("xoxb-"));
+    }
+
+    #[test]
+    fn detects_slack_user_token_variant() {
+        // xoxp-, xoxa-, xoxr- are valid Slack prefixes too.
+        let s = "user token: xoxp-FAKE-EXAMPLE-DO-NOT-USE-user-token-for-eval";
+        let f = scan(s);
+        assert_eq!(kinds(&f), vec![SecretKind::SlackToken]);
+        assert!(f[0].text.starts_with("xoxp-"));
+    }
+
+    #[test]
     fn duplicate_secrets_yield_two_findings() {
         // The detector itself doesn't dedupe by text — that's the
         // PlaceholderMap's job (collapsing duplicates to the same
