@@ -14,9 +14,11 @@ name = "e02-base-url-relay"
 path = "src/main.rs"
 
 [dependencies]
-# eventsource-stream is workspace-declared but unused in this experiment for
-# now — we pass-through bytes via reqwest's bytes_stream(). We'll wire it in
-# when redaction lands in proxy-core; until then, no need to compile it here.
+# proxy-core wires in for Phase-1 outbound redaction (Phase 2 will add
+# response-side reversal). eventsource-stream stays out for now —
+# response bodies still pass through unmutated until SSE-aware reversal
+# lands.
+proxy-core = { path = "../../crates/proxy-core" }
 axum = { workspace = true }
 tokio = { workspace = true }
 reqwest = { workspace = true }

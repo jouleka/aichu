@@ -1,8 +1,16 @@
-// Pass-through relay handlers.
+// Phase-1 relay handlers with outbound redaction.
 //
-// For Week 1 we forward bytes in both directions without parsing. The job
-// is to prove streaming survives the relay; redaction lands in proxy-core,
-// not here.
+// Request side (Phase 1, this commit):
+//   - read inbound body
+//   - run `proxy_core::redact` over the body bytes; secrets are replaced
+//     with typed placeholders before the body leaves this process
+//   - forward the redacted body upstream
+//
+// Response side (Phase 2, follow-up): currently a pass-through. The
+// placeholders the model sees in its prompt will appear verbatim in
+// its response if it preserves them (which is what e03 is supposed to
+// measure). A future commit will add `proxy_core::reverse` on the
+// response stream so the user gets the original secrets back.
 
 use std::sync::Arc;
 
@@ -13,6 +21,8 @@ use axum::{
     http::{HeaderMap, Response, StatusCode},
     routing::post,
 };
+use bytes::Bytes;
+use proxy_core::PlaceholderMap;
 use reqwest::Client;
 
 use crate::RelayConfig;
@@ -53,7 +63,8 @@ async fn handle_openai_chat(
 }
 
 /// Forward `req` to `url` over reqwest and stream the upstream response back
-/// to the client. Hop-by-hop headers are stripped on both legs.
+/// to the client. Hop-by-hop headers are stripped on both legs. The request
+/// body is redacted via `proxy_core::redact` before forwarding.
 async fn forward(client: Client, url: String, req: Request) -> Response<Body> {
     let (parts, body) = req.into_parts();
 
@@ -66,6 +77,42 @@ async fn forward(client: Client, url: String, req: Request) -> Response<Body> {
                 StatusCode::BAD_REQUEST,
                 format!("read inbound body: {e}"),
             );
+        }
+    };
+
+    // Phase-1 redaction: run the body bytes through proxy-core. Secrets
+    // are substituted with typed placeholders before the body leaves
+    // this process.
+    //
+    // We operate on the raw bytes-as-UTF-8 rather than parsing the JSON
+    // first: secret patterns (sk-ant-..., AKIA..., etc.) don't contain
+    // JSON delimiters, so they're wholly inside string values and the
+    // structural JSON survives the substitution.
+    //
+    // The PlaceholderMap is per-request and dropped at function return.
+    // Counters reset per request; cross-request coreference (the same
+    // secret keeping `_001` across multiple turns of a conversation) is
+    // out of scope for Phase 1. Phase 2 will thread the map through to
+    // the response-side reversal pass, at which point we can also
+    // consider session-scoped maps.
+    let body_bytes = match std::str::from_utf8(&body_bytes) {
+        Ok(s) => {
+            let mut map = PlaceholderMap::new();
+            let redacted = proxy_core::redact(s, &mut map);
+            if !map.is_empty() {
+                tracing::info!(
+                    placeholders = map.len(),
+                    "redacted outbound body before forwarding to {url}",
+                );
+            }
+            Bytes::from(redacted)
+        }
+        Err(_) => {
+            // Non-UTF-8 body (binary?). Pass through unchanged; the
+            // body is unlikely to carry a secret-shaped substring we
+            // could match anyway.
+            tracing::debug!("non-utf8 inbound body, forwarding without redaction");
+            body_bytes
         }
     };
 
