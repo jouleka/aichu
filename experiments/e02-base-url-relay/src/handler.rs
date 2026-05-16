@@ -1,20 +1,38 @@
-// Phase-2a relay handlers with outbound redaction + non-streaming
-// response-side reversal.
+// Phase-2b relay handlers with outbound redaction + full response-side
+// reversal (non-streaming JSON + buffered SSE).
 //
-// Request side (Phase 1, landed earlier):
+// Request side (Phase 1):
 //   - read inbound body
 //   - run `proxy_core::redact` over the body bytes; secrets are replaced
 //     with typed placeholders before the body leaves this process
 //   - forward the redacted body upstream
 //
-// Response side (Phase 2a, this commit):
-//   - if the upstream response is `application/json` (i.e., the request
-//     was `stream: false`), buffer the body, run `proxy_core::reverse`
-//     against the PlaceholderMap from the outbound pass, and emit the
-//     reversed body to the client.
-//   - if the upstream response is `text/event-stream` (streaming), pass
-//     through unchanged. SSE-aware reversal (build-plan §6 gotcha:
-//     placeholders split across chunks) is Phase 2b.
+// Response side (Phase 2a + Phase 2b):
+//
+//   When the outbound pass minted no placeholders (no secrets in the
+//   prompt), the response always streams through unchanged regardless
+//   of content-type — streaming UX preserved for non-secret traffic.
+//
+//   When the outbound pass DID mint placeholders, the response is
+//   buffered, run through `proxy_core::reverse`, and emitted as a
+//   non-streaming body. This applies uniformly to application/json
+//   (Phase 2a) and text/event-stream (Phase 2b).
+//
+//   Trade-off (Phase 2b): when secrets are in the prompt and the
+//   response is SSE, the user loses streaming UX — the proxy holds
+//   the entire response until it's complete, then delivers it as one
+//   chunk.
+//
+//   Known limitation (Phase 2b → Phase 2c): the whole-response
+//   buffering only reverses placeholders that land WHOLLY inside a
+//   single SSE event's `text_delta` payload. If the model fragments a
+//   placeholder across two `content_block_delta` events (e.g. event 1
+//   ends with `«SECRET_AWS_` and event 2 begins with `KEY_001»`), the
+//   bytes between them include JSON/SSE framing (`"}}\n\nevent: ...`)
+//   which breaks the reverse regex's `[A-Z0-9_]+_[0-9]+` character
+//   class. The placeholder stays unreversed and the user sees the
+//   fragments. Phase 2c's per-event SSE-aware reversal fixes both
+//   issues (streaming UX + cross-event split).
 
 use std::sync::Arc;
 
@@ -70,14 +88,17 @@ async fn handle_openai_chat(
 /// on both legs. The request body is redacted via `proxy_core::redact`
 /// before forwarding.
 ///
-/// Response handling branches on upstream content-type:
-///   - `application/json` (non-streaming, request was `stream: false`)
-///     and the request had at least one placeholder substituted →
-///     buffer the response, run `proxy_core::reverse` to restore the
-///     original secret in the response text, emit non-streaming.
-///   - Anything else (notably `text/event-stream` for `stream: true`)
-///     → stream the body through unchanged; SSE-aware reversal is
-///     out of scope for Phase 2a.
+/// Response handling branches on whether the outbound pass redacted
+/// anything:
+///   - **No placeholders minted** (no secrets in the prompt) → response
+///     streams through unchanged regardless of content-type.
+///     Streaming UX preserved.
+///   - **Placeholders minted** → response is buffered to bytes, run
+///     through `proxy_core::reverse` against the PlaceholderMap, and
+///     emitted as a non-streaming Body. Applies to both
+///     `application/json` and `text/event-stream`. SSE streaming UX
+///     is lost in this case; Phase 2c will restore it via per-event
+///     reversal that doesn't require buffering the whole response.
 async fn forward(client: Client, url: String, req: Request) -> Response<Body> {
     let (parts, body) = req.into_parts();
 
@@ -152,36 +173,39 @@ async fn forward(client: Client, url: String, req: Request) -> Response<Body> {
     let status = upstream_resp.status();
     let upstream_headers = upstream_resp.headers().clone();
 
-    // Decide whether we can apply the reverse pass now (Phase 2a:
-    // non-streaming JSON) or have to pass through unchanged (Phase 2b
-    // territory: SSE and friends).
-    let content_type = upstream_headers
-        .get("content-type")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-    // `starts_with` covers `application/json; charset=utf-8` which
-    // some providers emit. Anthropic and OpenAI both return plain
-    // `application/json` on non-streaming endpoints.
-    let is_json = content_type.starts_with("application/json");
-
-    let resp_body = if is_json && !placeholder_map.is_empty() {
-        // Buffer the full body, run the reverse pass, hand back as a
-        // non-streaming Body. Same UTF-8 round-trip and same "JSON
+    let resp_body = if placeholder_map.is_empty() {
+        // No redaction happened on the outbound side → nothing to
+        // reverse on the inbound side. Stream through unchanged.
+        // Preserves streaming UX for the common no-secret case.
+        Body::from_stream(upstream_resp.bytes_stream())
+    } else {
+        // The outbound pass minted at least one placeholder. Buffer
+        // the full response, run the reverse pass, hand back as a
+        // non-streaming Body. Same UTF-8 round-trip and "JSON
         // delimiters don't appear inside placeholders" invariant we
         // relied on for the outbound redaction.
+        //
+        // For SSE responses this means losing streaming for the
+        // with-secrets case — see the file header for the Phase 2b
+        // trade-off note.
+        let content_type = upstream_headers
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
         match upstream_resp.bytes().await {
             Ok(bytes) => match std::str::from_utf8(&bytes) {
                 Ok(s) => {
                     let restored = proxy_core::reverse(s, &placeholder_map);
                     tracing::info!(
                         placeholders = placeholder_map.len(),
-                        "applied reverse pass to non-streaming JSON response from {url}",
+                        content_type = %content_type,
+                        "buffered + reverse-applied response from {url}",
                     );
                     Body::from(Bytes::from(restored))
                 }
                 Err(_) => {
                     tracing::debug!(
-                        "non-utf8 JSON response from {url}, returning unchanged",
+                        "non-utf8 response from {url}, returning unchanged",
                     );
                     Body::from(bytes)
                 }
@@ -193,11 +217,6 @@ async fn forward(client: Client, url: String, req: Request) -> Response<Body> {
                 );
             }
         }
-    } else {
-        // Streaming or non-JSON: pass through unchanged. The user will
-        // see placeholders in their response if the model preserved
-        // them; Phase 2b will buffer SSE chunks and reverse them.
-        Body::from_stream(upstream_resp.bytes_stream())
     };
 
     let mut builder = Response::builder().status(status);

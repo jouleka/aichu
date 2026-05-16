@@ -217,6 +217,122 @@ async fn relay_reverses_placeholder_in_non_streaming_json_response() -> Result<(
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn relay_reverses_placeholder_in_streaming_sse_response() -> Result<()> {
+    // Phase 2b contract: when the upstream response is text/event-stream
+    // (request was stream: true) AND we redacted something on the
+    // outbound side, the relay must buffer the response, run reverse,
+    // and emit the original secret back to the client.
+    //
+    // Trade-off documented in handler.rs: with-secrets responses are
+    // currently buffered (no streaming UX) until SSE-aware per-event
+    // reversal (Phase 2c) lands. No-secrets responses stay streaming.
+    let upstream = spawn_upstream_returning_sse_with_placeholder("/v1/messages").await?;
+
+    let config = RelayConfig {
+        anthropic_upstream: format!("http://{}", upstream.addr),
+        openai_upstream: "http://127.0.0.1:1".to_string(),
+    };
+    let (relay_addr, shutdown_tx) = spawn_relay(config).await?;
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()?;
+
+    // stream: true triggers the SSE response from the upstream mock.
+    let resp = client
+        .post(format!("http://{relay_addr}/v1/messages"))
+        .header("x-api-key", "fake-test-key")
+        .json(&json!({
+            "model": "claude-opus-4-5",
+            "max_tokens": 100,
+            "stream": true,
+            "messages": [{
+                "role": "user",
+                "content": "Debug AKIAIOSFODNN7EXAMPLE on S3 please.",
+            }],
+        }))
+        .send()
+        .await?;
+
+    assert_eq!(resp.status(), 200);
+    let body = resp.text().await?;
+
+    // The SSE upstream emits a content_block_delta event whose JSON
+    // contains «SECRET_AWS_KEY_001» — see
+    // spawn_upstream_returning_sse_with_placeholder. The relay's Phase
+    // 2b reverse pass must substitute back to AKIAIOSFODNN7EXAMPLE
+    // before the client sees the body.
+    assert!(
+        body.contains("AKIAIOSFODNN7EXAMPLE"),
+        "secret not restored in streaming response; client sees:\n{body}"
+    );
+    assert!(
+        !body.contains("\u{ab}SECRET_"),
+        "placeholder leaked to client (reverse pass failed):\n{body}"
+    );
+    // Non-placeholder content must still be present.
+    assert!(body.contains("needs s3:GetObject"));
+
+    let _ = shutdown_tx.send(());
+    Ok(())
+}
+
+/// Phase 2c spec, encoded as an ignored test.
+///
+/// When a placeholder is fragmented across two `content_block_delta`
+/// events (e.g. event 1 ends with `«SECRET_AWS_` and event 2 begins
+/// with `KEY_001»`), the whole-response buffer contains the placeholder
+/// with JSON/SSE framing bytes (`"}}\n\nevent: content_block_delta\n
+/// data: {"...,"text":"`) inserted between the two halves. proxy_core's
+/// reverse regex `«SECRET_[A-Z0-9_]+_[0-9]+»` cannot match across those
+/// framing bytes — `"` / `}` / whitespace aren't in the character class
+/// — so the placeholder stays in the response and the user sees the
+/// fragments.
+///
+/// Phase 2c will land per-event SSE parsing that buffers `text_delta`
+/// payloads at the JSON level, eliminating this gap. This test
+/// encodes the desired future behavior; it currently fails and is
+/// marked `#[ignore]` until Phase 2c.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "Phase 2c: per-event SSE reversal handles placeholders split across content_block_delta events"]
+async fn phase_2c_relay_reverses_placeholder_split_across_sse_events() -> Result<()> {
+    let upstream =
+        spawn_upstream_returning_sse_with_split_placeholder("/v1/messages").await?;
+
+    let config = RelayConfig {
+        anthropic_upstream: format!("http://{}", upstream.addr),
+        openai_upstream: "http://127.0.0.1:1".to_string(),
+    };
+    let (relay_addr, shutdown_tx) = spawn_relay(config).await?;
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()?;
+    let resp = client
+        .post(format!("http://{relay_addr}/v1/messages"))
+        .header("x-api-key", "fake-test-key")
+        .json(&json!({
+            "model": "claude-opus-4-5",
+            "stream": true,
+            "max_tokens": 100,
+            "messages": [{
+                "role": "user",
+                "content": "Debug AKIAIOSFODNN7EXAMPLE on S3.",
+            }],
+        }))
+        .send()
+        .await?;
+
+    let body = resp.text().await?;
+    // Phase 2c desired behavior:
+    assert!(body.contains("AKIAIOSFODNN7EXAMPLE"));
+    assert!(!body.contains("\u{ab}SECRET_"));
+
+    let _ = shutdown_tx.send(());
+    Ok(())
+}
+
 // --- mock upstream scaffolding ---
 
 #[derive(Clone)]
@@ -308,6 +424,111 @@ async fn fixed_response_handler(
     state.request_count.fetch_add(1, Ordering::Relaxed);
     *state.last_body.lock().unwrap() = Some(body);
     Json((*state.response).clone())
+}
+
+/// Mock upstream that returns an SSE stream with three
+/// `content_block_delta` events. The placeholder sits WHOLLY inside
+/// event 2's `text_delta.text` field; events 1 and 3 carry the
+/// surrounding prose ("Your " and " needs s3:GetObject."). This
+/// exercises the buffer-then-reverse path concatenating multiple
+/// events, but NOT the cross-event-split case where the placeholder
+/// itself spans multiple events — that's a known Phase 2b limitation
+/// (intermediate JSON/SSE framing breaks the placeholder regex) and
+/// is captured by `phase_2c_relay_reverses_placeholder_split_across_sse_events`
+/// (currently `#[ignore]`d).
+async fn spawn_upstream_returning_sse_with_placeholder(
+    path: &'static str,
+) -> Result<CapturingUpstream> {
+    spawn_sse_upstream(
+        path,
+        vec![
+            r#"{"type":"content_block_delta","delta":{"type":"text_delta","text":"Your "}}"#
+                .to_string(),
+            format!(
+                r#"{{"type":"content_block_delta","delta":{{"type":"text_delta","text":"{}"}}}}"#,
+                "\u{ab}SECRET_AWS_KEY_001\u{bb}",
+            ),
+            r#"{"type":"content_block_delta","delta":{"type":"text_delta","text":" needs s3:GetObject."}}"#
+                .to_string(),
+        ],
+    )
+    .await
+}
+
+/// Phase-2c fixture: the placeholder is split across two events. Event 1
+/// has the `«SECRET_AWS_` prefix; event 2 has the `KEY_001»` suffix.
+async fn spawn_upstream_returning_sse_with_split_placeholder(
+    path: &'static str,
+) -> Result<CapturingUpstream> {
+    spawn_sse_upstream(
+        path,
+        vec![
+            r#"{"type":"content_block_delta","delta":{"type":"text_delta","text":"Your «SECRET_AWS_"}}"#
+                .to_string(),
+            r#"{"type":"content_block_delta","delta":{"type":"text_delta","text":"KEY_001» needs s3:GetObject."}}"#
+                .to_string(),
+        ],
+    )
+    .await
+}
+
+/// Spin up an axum SSE upstream that emits `events` as
+/// `content_block_delta` events. Captures the request body for
+/// caller assertions.
+async fn spawn_sse_upstream(
+    path: &'static str,
+    events: Vec<String>,
+) -> Result<CapturingUpstream> {
+    use axum::response::sse::{Event as SseEvent, Sse};
+    use futures_util::stream;
+    use std::convert::Infallible;
+
+    let request_count = Arc::new(AtomicU64::new(0));
+    let last_body = Arc::new(std::sync::Mutex::new(None));
+
+    #[derive(Clone)]
+    struct SseState {
+        request_count: Arc<AtomicU64>,
+        last_body: Arc<std::sync::Mutex<Option<Bytes>>>,
+        events: Arc<Vec<String>>,
+    }
+    let state = SseState {
+        request_count: request_count.clone(),
+        last_body: last_body.clone(),
+        events: Arc::new(events),
+    };
+
+    let handler = move |State(state): State<SseState>,
+                        body: Bytes|
+          -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Sse<_>> + Send>,
+    > {
+        state.request_count.fetch_add(1, Ordering::Relaxed);
+        *state.last_body.lock().unwrap() = Some(body);
+
+        let events: Vec<Result<SseEvent, Infallible>> = state
+            .events
+            .iter()
+            .map(|data| {
+                Ok(SseEvent::default().event("content_block_delta").data(data))
+            })
+            .collect();
+        Box::pin(async move { Sse::new(stream::iter(events)) })
+    };
+
+    let app = Router::new().route(path, post(handler)).with_state(state);
+
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    Ok(CapturingUpstream {
+        addr,
+        request_count,
+        last_body,
+    })
 }
 
 async fn spawn_relay(config: RelayConfig) -> Result<(SocketAddr, oneshot::Sender<()>)> {
