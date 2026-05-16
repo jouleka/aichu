@@ -89,18 +89,83 @@ These will be added as we run the eval. Do not include real secrets — use vend
 
 ### Manual (real Anthropic run)
 
-> Not yet run. Requires `ANTHROPIC_API_KEY` and a fixture corpus
-> (`prompts/` currently empty). When ready:
+> **Status: deferred.** Harness is wired and tested end-to-end against a
+> mock Anthropic server. Real-API run is gated on Anthropic Console
+> credits; documented below as a follow-up. When ready:
 >
 > ```bash
 > export ANTHROPIC_API_KEY=sk-ant-...
 > cargo run --release -p e03-placeholder-eval -- \
->     --prompts prompts/ \
+>     --prompts experiments/e03-placeholder-eval/prompts/ \
 >     --provider anthropic \
->     --model claude-opus-4-7-20250514 \
+>     --model claude-opus-4-5 \
 >     --formats all \
->     --out results.json
+>     --out e03-results.json
 > ```
+>
+> Estimated cost: 50 fixtures × 6 formats = 300 calls × ~$0.02/call on
+> Opus 4.5 ≈ **$5–6 total**. Sonnet 4.5/Haiku are ~10× cheaper.
+
+### Research-based justification for the placeholder design (2026-05-16)
+
+Without burning budget on an empirical run, the public record gives
+enough signal to decide whether `«SECRET_TYPE_N»` is the right pick.
+**Summary: the academic state-of-the-art independently converged on
+the same design principle.**
+
+| Source | Placeholder | Notes |
+|---|---|---|
+| **arxiv 2604.12064** (LLM-Redactor, April 2026) — closest prior art to this experiment | `⟨KIND_N⟩` using Unicode mathematical angle brackets (U+27E8 / U+27E9) | Explicit rationale in the paper: "rare Unicode angle brackets to avoid collision with user text that might contain literal `{EMAIL_1}` syntax." Same design principle as our French guillemets `«…»` (U+00AB / U+00BB). The paper evaluates 8 privacy-preserving techniques over a 1,300-sample / 4,014-annotation benchmark and reports **0.6% combined leak on PII, zero exact leaks on 500 PII samples** for the redaction + placeholder-restoration path. The paper does **not** publish per-format preservation rates (it picks one format and runs with it), so we cannot read off "guillemets vs angle brackets" numbers from it. |
+| **arxiv 2508.05545** (PRvL, 2025) — broader PII-redaction evaluation across several LLM architectures and training strategies | `[NAME]`, `[EMAIL]`, etc. | Focuses on whether PII is masked correctly. No quantitative data on placeholder format fidelity. (See paper for the full model list — we did not verify every name.) |
+| **prompt-sentinel** (Python OSS, George Kour) | `__SECRET_1__` | Reversible via per-process singleton context. Same coreference semantics we use. No published preservation rates. Format is character-heavier than single-character bracket pairs; we did not measure token counts. |
+| **Microsoft Presidio + LiteLLM** | `{{PERSON_1}}` (mustache-style) | Same-value → same-placeholder coreference stability. Build-plan §7 hypothesizes mustache syntax may trigger template-completion behavior in models trained on Jinja-style prompts; not empirically tested here. |
+| **WangYihang/llm-redactor** (Go, OSS) — direct prior art for the same product idea | `[REDACTED]` | Local transparent proxy for AI coding agents (Claude/Gemini/Codex). Uses the literal `[REDACTED]` placeholder, which build-plan §7 flags as one of the worst-case formats (models often "helpfully expand" it: "Please provide your actual key here"). No documented round-trip / reversal mechanism in their README — they appear to redact-and-drop, not redact-and-restore. Implication: a competitor product shipped with the format our build-plan flags as worst-case. That tells us our floor is no worse than theirs — not a quality claim, just a floor. |
+
+**Convergence finding.** The arxiv 2026 paper and aichu chose
+near-identical placeholder shapes for the same reason. Both use a rare
+Unicode bracket pair (the paper picked U+27E8/U+27E9; we picked
+U+00AB/U+00BB), typed by entity kind, numbered for coreference. The
+paper's choice isn't documented as empirically superior — it's a
+design principle. The principle is: "use a delimiter the model will
+treat as opaque, not parse as syntax, and not occur naturally in user
+code." Both our choice and theirs satisfy this.
+
+**What this analysis does NOT establish.** We do not have per-format
+preservation numbers from the live API. The arxiv paper's 0.6% leak
+rate measures their A+B+C *combined* pipeline (local-only routing +
+redaction-with-placeholder + semantic rephrasing) against an unnamed
+cloud target; it is not a placeholder-format-isolation number and
+does not transfer directly to our setting. Whether `«…»` specifically
+survives Anthropic Opus 4.5 / GPT-5.x round-trips at ≥98% (the
+build-plan §9 kill threshold) is **still a deferred empirical
+question**. The harness is ready when the budget is.
+
+**Defensive design move worth keeping in mind.** If a real run later
+shows guillemets surviving at, say, 92% (close to threshold but not
+clean), the harness's `PlaceholderFormat` enum can carry a 7th variant
+using U+27E8/U+27E9 to match the arxiv paper exactly, and the
+production proxy can ship both formats behind a CLI flag. We don't
+implement it now (per Rule 2: nothing speculative), but the shape is
+trivially extensible.
+
+### Risk 2 verdict
+
+**Conditionally validated.** The placeholder design follows the
+academic state-of-the-art's published rationale. The harness is
+empirically wired (14 automated tests, including round-trip against a
+local axum mock pretending to be Anthropic). The actual cross-format
+preservation rates on live Anthropic / OpenAI / Google traffic remain
+the one missing piece, deferred to a budget-gated follow-up.
+
+The decision to move forward to `crates/proxy-core` rests on:
+1. Convergence with the arxiv state-of-the-art (rare-Unicode-bracket
+   design principle) — qualitative signal.
+2. Build-plan §7's qualitative testing (favored guillemets) —
+   qualitative signal.
+3. Competitor product (`WangYihang/llm-redactor`) shipping with
+   the *known-bad* `[REDACTED]` format — implies our floor is no
+   worse than theirs.
+4. The harness can run in 10 minutes whenever budget exists.
 
 ### What this commit ships and deliberately omits
 
