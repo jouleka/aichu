@@ -1,11 +1,16 @@
 // Detector pipeline: aho-corasick keyword pre-filter → regex per kind →
-// collect non-overlapping Findings sorted by start.
+// entropy gate (per kind, optional) → collect non-overlapping
+// Findings sorted by start.
 //
 // The pre-filter is a perf optimization, not correctness: we run regex
 // only for kinds whose keyword is present in the input. Removing the
 // pre-filter would still produce correct results (just slower). The
 // pre-filter test in `rules.rs` pins the invariant that every regex
 // match contains the kind's keyword.
+//
+// The entropy gate is a precision filter for kinds with no distinctive
+// prefix (AWS_SECRET). For prefix-typed kinds the gate is `None` and
+// every regex match becomes a Finding.
 
 use std::sync::OnceLock;
 
@@ -59,7 +64,25 @@ pub fn scan(input: &str) -> Vec<Finding> {
 
     let mut findings: Vec<Finding> = Vec::new();
     for (kind, re) in &c.regexes {
-        for m in re.find_iter(input) {
+        let group_idx = kind.secret_capture_group();
+        let threshold = kind.min_entropy();
+        for caps in re.captures_iter(input) {
+            // `secret_capture_group` returns 0 for the whole match
+            // (prefix-typed kinds) or a higher index for identifier-
+            // anchored kinds where the captured secret excludes the
+            // identifier prefix.
+            let Some(m) = caps.get(group_idx) else {
+                continue;
+            };
+            // Apply the entropy gate, if any. For kinds without a
+            // distinctive prefix (AWS_SECRET), this is what stops
+            // all-zeros / repeating-pattern strings from being
+            // classified as secrets.
+            if let Some(min) = threshold {
+                if shannon_entropy(m.as_str()) < min {
+                    continue;
+                }
+            }
             findings.push(Finding {
                 kind: *kind,
                 start: m.start(),
@@ -96,6 +119,31 @@ pub fn scan(input: &str) -> Vec<Finding> {
         }
     }
     out
+}
+
+/// Shannon entropy of a byte sequence, in bits per character.
+///
+/// Random base64 strings score ~5.0; hex digits ~4.0; long repeating
+/// patterns approach 0. Used as a precision filter on kinds with no
+/// distinctive prefix — see `SecretKind::min_entropy`.
+pub fn shannon_entropy(s: &str) -> f64 {
+    if s.is_empty() {
+        return 0.0;
+    }
+    let mut counts = [0u32; 256];
+    for &b in s.as_bytes() {
+        counts[b as usize] += 1;
+    }
+    let len = s.len() as f64;
+    let mut h = 0.0;
+    for c in counts.iter() {
+        if *c == 0 {
+            continue;
+        }
+        let p = *c as f64 / len;
+        h -= p * p.log2();
+    }
+    h
 }
 
 #[cfg(test)]
@@ -238,6 +286,122 @@ mod tests {
         let f = scan(s);
         assert_eq!(kinds(&f), vec![SecretKind::SlackToken]);
         assert!(f[0].text.starts_with("xoxb-"));
+    }
+
+    #[test]
+    fn shannon_entropy_zero_on_constant_string() {
+        // Repeating one character has zero entropy by definition.
+        assert_eq!(super::shannon_entropy("aaaaaaaaaa"), 0.0);
+        assert_eq!(super::shannon_entropy(""), 0.0);
+    }
+
+    #[test]
+    fn shannon_entropy_high_on_random_base64() {
+        // AWS's published example secret. Real AWS secrets are
+        // generated random, ~5.0 bits/char.
+        let secret = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
+        let h = super::shannon_entropy(secret);
+        assert!(
+            h > 4.0,
+            "expected entropy > 4.0 for random base64; got {h}",
+        );
+    }
+
+    #[test]
+    fn shannon_entropy_low_on_repeating_short_alphabet() {
+        // 40 zeros → entropy 0.0.
+        assert_eq!(super::shannon_entropy(&"0".repeat(40)), 0.0);
+        // 40 hex digits cycling 0123456789abcdef0123... → uniform over 16 chars → 4.0 exactly.
+        let hex = "0123456789abcdef".repeat(3) + &"0123456789ab"[..8];
+        let h = super::shannon_entropy(&hex);
+        // Allow a small tolerance — exact 4.0 is sensitive to the
+        // last partial cycle.
+        assert!(
+            (h - 4.0).abs() < 0.2,
+            "expected entropy ~4.0 for hex cycle; got {h}",
+        );
+    }
+
+    #[test]
+    fn detects_aws_secret_access_key_with_identifier() {
+        // AWS's own published example pair. The detector must find
+        // both the access key (AKIA...) AND the secret access key.
+        // The secret has no distinctive prefix, so it's anchored to
+        // the `aws_secret_access_key=` identifier.
+        let s = "\
+            AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE\n\
+            AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY\n\
+            AWS_REGION=us-east-1";
+        let f = scan(s);
+        let kinds_set: std::collections::HashSet<_> = f.iter().map(|x| x.kind).collect();
+        assert!(
+            kinds_set.contains(&SecretKind::AwsAccessKey),
+            "missing AwsAccessKey in {f:?}",
+        );
+        assert!(
+            kinds_set.contains(&SecretKind::AwsSecretAccessKey),
+            "missing AwsSecretAccessKey in {f:?}",
+        );
+        let secret_finding = f
+            .iter()
+            .find(|x| x.kind == SecretKind::AwsSecretAccessKey)
+            .unwrap();
+        // The captured text must be just the 40-char secret, not the
+        // identifier prefix or trailing newline.
+        assert_eq!(secret_finding.text, "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY");
+    }
+
+    #[test]
+    fn does_not_flag_aws_secret_with_low_entropy() {
+        // A 40-character all-zeros string after the identifier looks
+        // like our regex pattern but obviously isn't a real secret.
+        // The entropy gate must drop it.
+        let s = "AWS_SECRET_ACCESS_KEY=0000000000000000000000000000000000000000";
+        let f = scan(s);
+        let secret_kinds: Vec<_> = f
+            .iter()
+            .filter(|x| x.kind == SecretKind::AwsSecretAccessKey)
+            .collect();
+        assert!(
+            secret_kinds.is_empty(),
+            "all-zeros should be entropy-filtered; got {secret_kinds:?}",
+        );
+    }
+
+    #[test]
+    fn does_not_flag_aws_secret_when_identifier_is_a_word_suffix() {
+        // `\b` before the identifier prevents the regex from matching
+        // when `aws_secret_access_key` is a suffix of a larger token
+        // like `not_aws_secret_access_key` or
+        // `customer_aws_secret_access_key_hint`. Otherwise a
+        // misnamed config key could trip an unintended redaction.
+        let s = "not_aws_secret_access_key=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
+        let f = scan(s);
+        assert!(
+            !f.iter().any(|x| x.kind == SecretKind::AwsSecretAccessKey),
+            "suffix-of-larger-identifier must not be flagged: {f:?}",
+        );
+
+        let s2 = "customer_aws_secret_access_key_extra=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
+        let f2 = scan(s2);
+        assert!(
+            !f2.iter().any(|x| x.kind == SecretKind::AwsSecretAccessKey),
+            "embedded-within-larger-identifier must not be flagged: {f2:?}",
+        );
+    }
+
+    #[test]
+    fn does_not_flag_floating_base64_without_identifier() {
+        // A bare 40-char base64-ish string with no `aws_secret_*`
+        // identifier nearby is NOT classified as an AWS secret. This
+        // is what keeps the false-positive rate low: identifier
+        // anchoring is the primary precision lever.
+        let s = "Random data: wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY (a hash maybe)";
+        let f = scan(s);
+        assert!(
+            !f.iter().any(|x| x.kind == SecretKind::AwsSecretAccessKey),
+            "bare base64 without identifier must not be flagged: {f:?}",
+        );
     }
 
     #[test]

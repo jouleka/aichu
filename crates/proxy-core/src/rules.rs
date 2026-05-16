@@ -28,6 +28,14 @@ pub enum SecretKind {
     /// `xoxp-` (user), `xoxr-` (refresh) prefixes followed by
     /// team/user/secret segments.
     SlackToken,
+    /// AWS secret access key — a 40-char base64-ish string with no
+    /// distinctive prefix of its own. We rely on TWO precision levers
+    /// at once: (a) the regex is **identifier-anchored** to
+    /// `aws_secret_access_key=...` so a bare 40-char base64 elsewhere
+    /// won't trip it; (b) an **entropy gate** discards captures with
+    /// Shannon entropy below ~3.5, so an all-zeros or repeating
+    /// pattern after the identifier is also rejected.
+    AwsSecretAccessKey,
 }
 
 impl SecretKind {
@@ -42,6 +50,7 @@ impl SecretKind {
         SecretKind::StripeLiveKey,
         SecretKind::Jwt,
         SecretKind::SlackToken,
+        SecretKind::AwsSecretAccessKey,
     ];
 
     /// Keywords the aho-corasick pre-filter scans for. If `input` does
@@ -66,6 +75,14 @@ impl SecretKind {
             // "eyJ" = base64("{\"a"), how every JWT header starts.
             SecretKind::Jwt => &["eyJ"],
             SecretKind::SlackToken => &["xoxb-", "xoxa-", "xoxp-", "xoxr-"],
+            // Case-sensitive prefilter; we list both spellings users
+            // commonly write the identifier in (lowercase Python /
+            // uppercase .env). The regex itself uses `(?i)` so a
+            // freak mixed-case variant `Aws_Secret_...` would also
+            // match if it tripped the prefilter.
+            SecretKind::AwsSecretAccessKey => {
+                &["aws_secret_access_key", "AWS_SECRET_ACCESS_KEY"]
+            }
         }
     }
 
@@ -105,6 +122,65 @@ impl SecretKind {
             // engulfing surrounding kebab-case prose like
             // `xoxb-foo-bar-baz then more=value`.
             SecretKind::SlackToken => r"xox[abpr]-[A-Za-z0-9-]{10,200}",
+            // AWS secret access key. Identifier-anchored so we only
+            // fire on `aws_secret_access_key=<value>` shapes — group
+            // 1 is the 40-char base64-ish secret. The separator class
+            // covers .env (`=`), JSON ("...":"...", `:`), YAML
+            // (`: `), TOML (`=`), and quoted strings. The entropy
+            // gate (see min_entropy below) is the second filter.
+            //
+            // `\b` before the identifier is a precision lever: without
+            // it, the regex would match `not_aws_secret_access_key=...`
+            // or `customer_aws_secret_access_key_extra=...` because
+            // the underscore is a word char. With `\b`, the boundary
+            // requires a transition between word and non-word — so
+            // the identifier must be its own token, not a suffix of
+            // a larger one.
+            SecretKind::AwsSecretAccessKey => {
+                r#"(?i)\baws_secret_access_key[\s"':=]+([A-Za-z0-9/+=]{40})"#
+            }
+        }
+    }
+
+    /// Which capture group of `regex()` is the actual secret to redact.
+    /// Default 0 (the whole match). Identifier-anchored kinds use 1.
+    pub fn secret_capture_group(&self) -> usize {
+        match self {
+            SecretKind::AwsSecretAccessKey => 1,
+            _ => 0,
+        }
+    }
+
+    /// Minimum Shannon entropy (bits/char) the captured secret must
+    /// exceed to be reported. `None` = no gate (the prefix-typed
+    /// kinds are already high-confidence; gating them would only add
+    /// false negatives).
+    ///
+    /// `Some(3.5)` for AWS_SECRET: discards repeating patterns and
+    /// all-zeros / all-letters strings that match the regex's
+    /// `[A-Za-z0-9/+=]{40}` shape but aren't real random secrets.
+    ///
+    /// **Deviation from build-plan §3.** The plan suggests 4.5. We
+    /// use 3.5. Reasoning: AWS's own published example secret
+    /// (`wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY`) has measured
+    /// entropy ~4.5, sitting right on the build-plan threshold.
+    /// Real-world AWS secrets with unlucky character distributions
+    /// can dip below 4.5. The trade-off:
+    ///   - Threshold 4.5 (build plan): slightly higher precision;
+    ///     small risk of missing a real secret (privacy gap).
+    ///   - Threshold 3.5 (this code): may accept a 40-char hex
+    ///     string in an `aws_secret_access_key=` field as a "secret"
+    ///     (entropy ~4.0). The cost is a mild false positive —
+    ///     redact and reverse cancel out, the user sees the original
+    ///     hex back. The privacy guarantee remains intact.
+    ///
+    /// We err on the side of NOT missing real secrets, given the
+    /// project's headline is privacy. Per Rule 7, this divergence is
+    /// surfaced here rather than averaged silently.
+    pub fn min_entropy(&self) -> Option<f64> {
+        match self {
+            SecretKind::AwsSecretAccessKey => Some(3.5),
+            _ => None,
         }
     }
 
@@ -120,6 +196,7 @@ impl SecretKind {
             SecretKind::StripeLiveKey => "STRIPE_KEY",
             SecretKind::Jwt => "JWT",
             SecretKind::SlackToken => "SLACK_TOKEN",
+            SecretKind::AwsSecretAccessKey => "AWS_SECRET",
         }
     }
 }
@@ -197,6 +274,13 @@ mod tests {
                     format!("xoxp-{}", "a".repeat(10)),
                     format!("xoxa-{}", "a".repeat(10)),
                     format!("xoxr-{}", "a".repeat(10)),
+                ],
+            ),
+            (
+                SecretKind::AwsSecretAccessKey,
+                &[
+                    format!("AWS_SECRET_ACCESS_KEY={}", "a".repeat(40)),
+                    format!("aws_secret_access_key=\"{}\"", "b".repeat(40)),
                 ],
             ),
         ];
