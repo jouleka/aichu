@@ -135,3 +135,76 @@ service routing chat traffic in a way that doesn't consult
 `HTTPS_PROXY` on macOS. Cert pinning on `api3.cursor.sh` is a
 secondary defense; the primary block is the renderer + network-service
 architecture.
+
+### End-to-end Mode B smoke test (2026-05-16, post-redaction-wiring)
+
+With `proxy-core` wired into `AichuHandler`, verified the full
+redact + reverse round-trip works against real Anthropic through the
+MITM path. Prompt: `Echo this string back to me verbatim and add
+nothing else: AKIAIOSFODNN7EXAMPLE`. Claude received the prompt with
+`«SECRET_AWS_KEY_001»` in place of the key; Anthropic preserved the
+placeholder; the relay reversed it; client saw `AKIAIOSFODNN7EXAMPLE`
+in the response.
+
+The test surfaced **three real bugs** that the integration test suite
+did not catch (all fixed in the same commit cycle as the wiring):
+
+1. **OAuth refresh redaction.** Claude Code's `POST
+   platform.claude.com/v1/oauth/token` carries a `sk-`-shaped refresh
+   token. Our `OpenAiKey` regex matched it; the redacted body was
+   rejected (400) by Anthropic's OAuth endpoint; claude couldn't
+   refresh; every downstream call 401'd. Fix: path-scoped allow-list
+   in `handle_request` — only redact known prompt endpoints
+   (`/v1/messages`, `/v1/chat/completions`, `/v1/responses`,
+   `/backend-api/codex/responses`, `/zen/v1/responses`,
+   `/zen/v1/chat/completions`). Regression test:
+   `mitm_does_not_redact_non_prompt_paths`.
+
+2. **Per-pair state didn't survive across hudsucker handler clones.**
+   Trait docs say "each request/response pair is passed to the same
+   instance"; empirically, hudsucker spawns a fresh handler clone per
+   sub-request under MITM, so a `current_map` field set in
+   `handle_request` is empty in `handle_response`. Fix: move state to
+   `Arc<Mutex<HashMap<SocketAddr, PlaceholderMap>>>` keyed by
+   `HttpContext.client_addr` — survives the clone boundary because the
+   Arc is shared. Known limitation: HTTP/2 multiplexing on one
+   connection could collide; v0 accepts the risk, deferring a finer
+   key (e.g., stream id) to follow-up.
+
+3. **gzipped responses break the UTF-8 reverse path.** Anthropic
+   gzips its `text/event-stream` responses by default. We collect the
+   body bytes and run `std::str::from_utf8` before
+   `proxy_core::reverse`; gzipped bytes aren't valid UTF-8, so the
+   reverse fell through to the "pass through unchanged" branch and the
+   user saw placeholders. Fix: strip `Accept-Encoding` from the
+   outbound request headers — upstream then returns the body
+   uncompressed. The non-UTF-8 fallback was also promoted from `debug`
+   to `warn` so this class of bug surfaces in production logs.
+   Regression test:
+   `mitm_strips_accept_encoding_so_responses_are_uncompressed`.
+
+All three bugs are documented in `src/handler.rs` with pointers to
+the regression tests that pin the fixes.
+
+**Known v0 limitations recorded for follow-up:**
+
+- **Map leak on dropped connections.** If `handle_response` is never
+  called (TLS error after request forwarded, client cancellation,
+  upstream timeout), the `HashMap` entry for that `client_addr` is
+  never removed. Long-running proxy sessions could accumulate orphan
+  entries. v0 ships without mitigation; follow-up options are a size
+  cap, a TTL sweep, or a `Drop`-guard wrapper around the inserted map.
+- **Accept-Encoding test scope.** The regression test
+  `mitm_strips_accept_encoding_so_responses_are_uncompressed` asserts
+  redaction still works alongside the strip, not that the header was
+  actually removed from the outbound request. A tighter test needs a
+  mock that captures request headers, not just bodies. Acceptable for
+  v0 — the manual smoke test against real Anthropic confirms the
+  end-to-end behavior.
+- **Cursor CLI chat path TBD.** The allow-list does not yet include a
+  path for `cursor-agent` chat. The smoke test above only reached
+  `api2.cursor.sh/aiserver.v1.DashboardService/GetMe` (an admin/auth
+  path) because `cursor-agent` was unauthenticated locally. The actual
+  chat path will be identified when someone runs the smoke test with
+  a logged-in `cursor-agent` session; the allow-list will be extended
+  at that point.
