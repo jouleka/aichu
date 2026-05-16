@@ -1,0 +1,16 @@
+[package]
+name = "proxy-core"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+description = "Secret detection, redaction, and reverse-substitution for the aichu local proxy"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+aho-corasick = { workspace = true }
+regex = { workspace = true }
+tracing = { workspace = true }
