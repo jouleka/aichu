@@ -134,6 +134,89 @@ async fn relay_passes_through_body_with_no_secrets_unchanged() -> Result<()> {
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn relay_reverses_placeholder_in_non_streaming_json_response() -> Result<()> {
+    // Phase 2a contract: when the response is non-streaming JSON
+    // (content-type: application/json), and the upstream's response
+    // contains a placeholder the relay minted, the relay must swap it
+    // back to the original secret before handing the body to the
+    // client. The user-visible result: they typed AKIAIOS..., got an
+    // answer that mentions AKIAIOS..., never knew the placeholder
+    // existed.
+    let upstream = spawn_upstream_with_fixed_response(
+        "/v1/messages",
+        json!({
+            "id": "msg_test",
+            "type": "message",
+            "content": [
+                {
+                    "type": "text",
+                    "text": "Your \u{ab}SECRET_AWS_KEY_001\u{bb} needs s3:GetObject in its policy.",
+                }
+            ],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 10, "output_tokens": 12},
+        }),
+    )
+    .await?;
+
+    let config = RelayConfig {
+        anthropic_upstream: format!("http://{}", upstream.addr),
+        openai_upstream: "http://127.0.0.1:1".to_string(),
+    };
+    let (relay_addr, shutdown_tx) = spawn_relay(config).await?;
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()?;
+
+    let resp = client
+        .post(format!("http://{relay_addr}/v1/messages"))
+        .header("x-api-key", "fake-test-key")
+        .json(&json!({
+            "model": "claude-opus-4-5",
+            "max_tokens": 100,
+            "messages": [{
+                "role": "user",
+                "content": "Debug AKIAIOSFODNN7EXAMPLE on S3 please.",
+            }],
+        }))
+        .send()
+        .await?;
+
+    assert_eq!(resp.status(), 200);
+    let ct = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    assert!(
+        ct.starts_with("application/json"),
+        "expected JSON response from upstream, got {ct:?}"
+    );
+
+    let body = resp.text().await?;
+
+    // The whole point of the round-trip: client sees the original
+    // secret in its response, not the placeholder. If this fires, the
+    // reverse pass is broken or wasn't applied.
+    assert!(
+        body.contains("AKIAIOSFODNN7EXAMPLE"),
+        "secret not restored on response side; client sees: {body}"
+    );
+    assert!(
+        !body.contains("\u{ab}SECRET_"),
+        "placeholder leaked to client (reverse pass failed): {body}"
+    );
+
+    // Non-placeholder content should survive too.
+    assert!(body.contains("s3:GetObject in its policy."));
+
+    let _ = shutdown_tx.send(());
+    Ok(())
+}
+
 // --- mock upstream scaffolding ---
 
 #[derive(Clone)]
@@ -176,6 +259,55 @@ async fn capture(State(state): State<CapturingState>, body: Bytes) -> Json<Value
     state.request_count.fetch_add(1, Ordering::Relaxed);
     *state.last_body.lock().unwrap() = Some(body);
     Json(json!({"id": "msg_test", "type": "message", "content": []}))
+}
+
+/// Same shape as the capturing upstream, but returns a fixed JSON
+/// response body. Used by the reverse-pass test to put a known
+/// placeholder string in the response so we can assert the relay
+/// substitutes it back.
+async fn spawn_upstream_with_fixed_response(
+    path: &'static str,
+    fixed: Value,
+) -> Result<CapturingUpstream> {
+    let state = FixedResponseState {
+        request_count: Arc::new(AtomicU64::new(0)),
+        last_body: Arc::new(std::sync::Mutex::new(None)),
+        response: Arc::new(fixed),
+    };
+    let request_count = state.request_count.clone();
+    let last_body = state.last_body.clone();
+
+    let app = Router::new()
+        .route(path, post(fixed_response_handler))
+        .with_state(state);
+
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    Ok(CapturingUpstream {
+        addr,
+        request_count,
+        last_body,
+    })
+}
+
+#[derive(Clone)]
+struct FixedResponseState {
+    request_count: Arc<AtomicU64>,
+    last_body: Arc<std::sync::Mutex<Option<Bytes>>>,
+    response: Arc<Value>,
+}
+
+async fn fixed_response_handler(
+    State(state): State<FixedResponseState>,
+    body: Bytes,
+) -> Json<Value> {
+    state.request_count.fetch_add(1, Ordering::Relaxed);
+    *state.last_body.lock().unwrap() = Some(body);
+    Json((*state.response).clone())
 }
 
 async fn spawn_relay(config: RelayConfig) -> Result<(SocketAddr, oneshot::Sender<()>)> {
