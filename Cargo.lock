@@ -582,9 +582,13 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "axum",
+ "bytes",
  "futures-util",
+ "http-body-util",
  "hudsucker",
+ "proxy-core",
  "reqwest",
+ "serde_json",
  "tempfile",
  "tokio",
  "tracing",

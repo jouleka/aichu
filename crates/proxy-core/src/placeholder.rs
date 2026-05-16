@@ -28,7 +28,19 @@ impl PlaceholderFormat {
 ///
 /// Use `placeholder_for(kind, secret)` on the outbound (prompt) side and
 /// `original_for(placeholder)` on the inbound (response) side.
-#[derive(Debug, Default)]
+///
+/// `Clone` is provided so the map can be carried inside handler types
+/// that themselves require `Clone` (e.g., hudsucker's `HttpHandler`
+/// trait bound). **Cloning is only safe when the map is empty** —
+/// after secrets have been minted, the forward and reverse tables on
+/// each clone are independent, so populating both clones in parallel
+/// would diverge and break the round-trip contract (a secret minted
+/// on clone A wouldn't reverse on clone B's response).
+///
+/// In practice this is enforced by usage: callers clone the handler
+/// at construction time (empty map), then redact and reverse on the
+/// same clone for a given request/response pair.
+#[derive(Debug, Clone, Default)]
 pub struct PlaceholderMap {
     /// Forward: (kind, secret text) → placeholder string. We key by both
     /// kind AND text so the same string matched by two different kinds
