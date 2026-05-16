@@ -1,4 +1,4 @@
-//! Integration test for the proxy-core ↔ e01 wiring.
+//! Integration test for the proxy-core ↔ proxy-mitm wiring.
 //!
 //! Mirrors the contract e02 already enforces, but through the
 //! hudsucker MITM path: a request body with a secret-shaped substring
@@ -9,7 +9,8 @@
 //!
 //! Uses plain HTTP through the proxy (not HTTPS), same shape as the
 //! existing `proxy_round_trip` test. The actual HTTPS/CA round-trip
-//! is exercised by the manual smoke test in the e01 README.
+//! is exercised by the manual smoke test recorded in
+//! `experiments/e01-hudsucker-mitm/README.md`.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -28,7 +29,7 @@ use tempfile::TempDir;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::oneshot;
 
-use e01_hudsucker_mitm::{ca::load_or_create_ca, handler::AichuHandler, run_proxy};
+use proxy_mitm::{ca::load_or_create_ca, handler::AichuHandler, run_proxy};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn mitm_redacts_aws_key_before_forwarding() -> Result<()> {

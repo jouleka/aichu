@@ -1,9 +1,14 @@
-// e01-hudsucker-mitm — Week 1, Risk 1
+// proxy-mitm — hudsucker-based HTTPS MITM proxy with a local rcgen CA.
 //
-// Library surface used by both the binary and the integration tests.
-// Production code lives in `ca`, `handler`, and the proxy wiring below.
+// Library surface consumed by the `aichu` CLI binary and the integration
+// tests. Production code lives in `ca`, `handler`, and the proxy wiring
+// below.
 //
-// See README.md in this crate for goal, kill criteria, and how to run.
+// Risk-validation history: this crate started as the Week-1 experiment
+// `experiments/e01-hudsucker-mitm` testing whether a Hudsucker proxy could
+// MITM Claude Code CLI's streaming `/v1/messages` traffic end-to-end. That
+// risk was validated for the CLI scope; the experiment's README is preserved
+// at `experiments/e01-hudsucker-mitm/README.md` as the historical record.
 
 pub mod ca;
 pub mod handler;

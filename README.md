@@ -2,7 +2,7 @@
 
 Local Rust proxy that redacts secrets from prompts sent to AI coding agents (Claude Code, Codex, OpenCode, Cursor CLI), then restores them in responses.
 
-> **Status:** Week 1 risks validated. Production code has begun (`crates/proxy-core`) and is wired through both proxy modes (`experiments/e01-hudsucker-mitm`, `experiments/e02-base-url-relay`). The end-to-end redaction round-trip works against real Anthropic traffic through both modes. See [Threat model](#threat-model) for guarantees + known limitations.
+> **Status:** Week 1 risks validated. Production code has begun (`crates/proxy-core`, `crates/proxy-mitm`) and is wired through both proxy modes (`crates/proxy-mitm`, `experiments/e02-base-url-relay`). The end-to-end redaction round-trip works against real Anthropic traffic through both modes. See [Threat model](#threat-model) for guarantees + known limitations.
 
 ## Why this exists
 
@@ -25,13 +25,11 @@ Each experiment's README records its goal, run instructions, and result (✅/❌
 ## Running an experiment
 
 ```bash
-cd experiments/e01-hudsucker-mitm
+cd experiments/e02-base-url-relay
 cargo run --release
 ```
 
-Each experiment is its own binary crate. Workspace-level `cargo build` builds everything.
-
-> **Note on duplicate hyper versions in `Cargo.lock`.** Hudsucker 0.19 (used by `e01`) is built on hyper 0.14, while axum 0.7 (used by `e02`) is built on hyper 1.x. They never share types — each experiment is a separate binary — so the duplicate is intentional. It will collapse when the production layout consolidates around a single stack.
+Each experiment is its own binary crate. Workspace-level `cargo build` builds everything. Note: `e01-hudsucker-mitm` has graduated to `crates/proxy-mitm/` and is now consumed as a library; the `aichu` CLI binary that wires it together is forthcoming (see `crates/cli/` in the layout below).
 
 ## Project structure
 
@@ -43,10 +41,10 @@ aichu/
 ├── docs/
 │   └── build-plan.md       # full architectural plan
 ├── crates/
-│   └── proxy-core/         # detection + redaction + reverse (used by both modes)
-└── experiments/            # week-1 risk-validation crates (will graduate to
-    │                       #  crates/proxy-server and crates/proxy-mitm)
-    ├── e01-hudsucker-mitm/ # Mode B: HTTPS MITM with on-the-fly rcgen CA
+│   ├── proxy-core/         # detection + redaction + reverse (used by both modes)
+│   └── proxy-mitm/         # Mode B: HTTPS MITM with on-the-fly rcgen CA (graduated from e01)
+└── experiments/            # week-1 risk-validation crates
+    ├── e01-hudsucker-mitm/ # historical record only (code graduated to crates/proxy-mitm)
     ├── e02-base-url-relay/ # Mode A: HTTP localhost server, base-URL relay
     └── e03-placeholder-eval/  # harness for measuring placeholder preservation
 ```
@@ -54,8 +52,8 @@ aichu/
 ## Eventual production layout (in progress)
 
 - `crates/proxy-core/`   — redaction pipeline, placeholder map (shared) ✅ shipped
+- `crates/proxy-mitm/`   — Mode B: Hudsucker MITM ✅ shipped
 - `crates/proxy-server/` — Mode A: localhost HTTP server, base-URL relay (currently lives in `experiments/e02-base-url-relay/`)
-- `crates/proxy-mitm/`   — Mode B: Hudsucker MITM (currently lives in `experiments/e01-hudsucker-mitm/`)
 - `crates/cli/`          — `aichu run | trust | untrust | doctor` (not started)
 
 ## v0 scope: CLI tools only
@@ -187,7 +185,7 @@ suspect exposure.
   by `client_addr`. HTTP/2 multiplexed streams share a TCP connection
   (and thus a `client_addr`), so two truly concurrent requests on one
   connection could race. Not observed in practice; documented in
-  `experiments/e01-hudsucker-mitm/src/handler.rs`.
+  `crates/proxy-mitm/src/handler.rs`.
 - **Map leak on dropped connections.** If `handle_response` is never
   called (TLS error, client cancellation, upstream timeout), the
   HashMap entry for that `client_addr` is orphaned. Long-running
@@ -218,7 +216,7 @@ code:
   prompt endpoints (`/v1/messages`, `/v1/chat/completions`, etc.)
   trigger redaction. OAuth refresh, model metadata, and unrelated
   traffic flow through unchanged. See
-  `is_prompt_endpoint(path)` in `experiments/e01-hudsucker-mitm/src/handler.rs`.
+  `is_prompt_endpoint(path)` in `crates/proxy-mitm/src/handler.rs`.
 - **Bidirectional map is per-session, in-memory only.** See `PlaceholderMap`
   in `crates/proxy-core/src/placeholder.rs` — backed by `HashMap`s, no
   serialization, no Drop side-effect.

@@ -1,5 +1,11 @@
 # e01-hudsucker-mitm
 
+> **Experiment graduated.** This risk was validated for the CLI scope.
+> Production code now lives in [`crates/proxy-mitm`](../../crates/proxy-mitm/).
+> This README is preserved as the historical record of the risk evaluation
+> (goal, kill criteria, smoke-test results, v0 scope decision, and the three
+> bugs surfaced by the end-to-end test against real Anthropic).
+
 **Risk under test:** Can a Hudsucker-based MITM proxy (HTTP/2 + rustls + on-the-fly rcgen CA) successfully intercept streaming `/v1/messages` traffic from Claude Code CLI? Same question for Codex CLI's `/v1/responses`.
 
 ## Goal

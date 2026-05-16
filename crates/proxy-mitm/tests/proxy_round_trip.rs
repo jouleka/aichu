@@ -2,10 +2,9 @@
 //! must reach the upstream, return its SSE stream unmodified to the client,
 //! AND be observed by the AichuHandler.
 //!
-//! This is the RED test that drives the e01 implementation. It validates the
-//! shape of the wire — handler observes, body unmodified, no errors — without
-//! exercising the HTTPS/CA round-trip (that requires real coding-agent
-//! traffic and is validated manually).
+//! Validates the shape of the wire — handler observes, body unmodified, no
+//! errors — without exercising the HTTPS/CA round-trip (that requires real
+//! coding-agent traffic and is validated manually).
 
 use std::convert::Infallible;
 use std::net::SocketAddr;
@@ -23,7 +22,7 @@ use tempfile::TempDir;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::oneshot;
 
-use e01_hudsucker_mitm::{ca::load_or_create_ca, handler::AichuHandler, run_proxy};
+use proxy_mitm::{ca::load_or_create_ca, handler::AichuHandler, run_proxy};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn proxy_relays_sse_stream_and_logs_request() -> Result<()> {

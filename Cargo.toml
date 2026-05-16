@@ -2,7 +2,7 @@
 resolver = "2"
 members = [
     "crates/proxy-core",
-    "experiments/e01-hudsucker-mitm",
+    "crates/proxy-mitm",
     "experiments/e02-base-url-relay",
     "experiments/e03-placeholder-eval",
 ]
