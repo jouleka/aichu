@@ -18,6 +18,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "aichu"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "proxy-mitm",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "alloc-no-stdlib"
 version = "2.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"

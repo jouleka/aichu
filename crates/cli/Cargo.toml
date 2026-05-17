@@ -1,0 +1,19 @@
+[package]
+name = "aichu"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+# Single binary; Cargo defaults `name = "aichu"` and `path = "src/main.rs"`
+# from the package name, so no explicit `[[bin]]` block is needed.
+
+[dependencies]
+proxy-mitm = { path = "../proxy-mitm" }
+clap = { workspace = true }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
