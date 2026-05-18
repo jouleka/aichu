@@ -25,7 +25,7 @@ use serde_json::json;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::oneshot;
 
-use e02_base_url_relay::{RelayConfig, run_relay};
+use proxy_server::{RelayConfig, run_relay};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn relay_streams_anthropic_sse_intact() -> Result<()> {

@@ -24,7 +24,7 @@ use serde_json::{Value, json};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::oneshot;
 
-use e02_base_url_relay::{RelayConfig, run_relay};
+use proxy_server::{RelayConfig, run_relay};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn relay_redacts_aws_key_before_forwarding() -> Result<()> {

@@ -9,7 +9,7 @@ Throwaway validation crates for the three Week 1 risks identified in [`../docs/b
 | Crate | Risk under test | Status |
 |---|---|---|
 | [`e01-hudsucker-mitm`](e01-hudsucker-mitm) | Can we MITM real coding agents? | ✅ validated for CLI scope — graduated to [`crates/proxy-mitm`](../crates/proxy-mitm) |
-| [`e02-base-url-relay`](e02-base-url-relay) | Does no-MITM base-URL relay work? | not started |
+| [`e02-base-url-relay`](e02-base-url-relay) | Does no-MITM base-URL relay work? | ✅ validated — graduated to [`crates/proxy-server`](../crates/proxy-server) |
 | [`e03-placeholder-eval`](e03-placeholder-eval) | Do LLMs preserve placeholder tokens? | not started |
 
 ## Conventions

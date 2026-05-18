@@ -1,5 +1,11 @@
 # e02-base-url-relay
 
+> **Experiment graduated.** This risk was validated for the headline
+> endpoints. Production code now lives in [`crates/proxy-server`](../../crates/proxy-server/).
+> This README is preserved as the historical record of the risk
+> evaluation (goal, kill criteria, Phase 1/2a/2b shipping notes,
+> known limitations).
+
 **Risk under test:** Does the no-MITM "base-URL relay" architecture (Mode A) survive real coding-agent traffic? Specifically, can we proxy streaming `/v1/messages` (Anthropic) and `/v1/chat/completions` (OpenAI) over an HTTP localhost endpoint while keeping SSE intact?
 
 ## Goal

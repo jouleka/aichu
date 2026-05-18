@@ -1,31 +1,26 @@
 [package]
-name = "e02-base-url-relay"
-version = "0.0.0"
+name = "proxy-server"
+version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+repository.workspace = true
 publish = false
 
 [lib]
 path = "src/lib.rs"
 
-[[bin]]
-name = "e02-base-url-relay"
-path = "src/main.rs"
-
 [dependencies]
-# proxy-core wires in for Phase-1 outbound redaction (Phase 2 will add
-# response-side reversal). eventsource-stream stays out for now —
-# response bodies still pass through unmutated until SSE-aware reversal
-# lands.
-proxy-core = { path = "../../crates/proxy-core" }
+# proxy-core wires in for Phase-1 outbound redaction and Phase-2b
+# whole-response reversal. Phase 2c (per-event SSE reversal) is the
+# remaining streaming-UX gap.
+proxy-core = { path = "../proxy-core" }
 axum = { workspace = true }
 tokio = { workspace = true }
 reqwest = { workspace = true }
 futures-util = { workspace = true }
 bytes = { workspace = true }
 tracing = { workspace = true }
-tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }
 
 [dev-dependencies]

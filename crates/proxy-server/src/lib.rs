@@ -1,11 +1,18 @@
-// e02-base-url-relay — Week 1, Risk 3
+// proxy-server — Mode A localhost HTTP server (base-URL relay).
 //
-// Mode A: localhost HTTP server that forwards OpenAI- and Anthropic-shaped
-// requests to their real upstreams over HTTPS, preserving streaming SSE
-// responses byte-for-byte. No CA install required.
+// Forwards OpenAI- and Anthropic-shaped requests to their real upstreams
+// over HTTPS, preserving streaming SSE responses byte-for-byte. No CA
+// install required — clients reach this server by setting their base URL.
 //
-// Library surface used by both the binary and the integration tests.
+// Library surface consumed by future CLI wiring and the integration tests.
 // Production code lives in `handler` and the wiring below.
+//
+// Risk-validation history: this crate started as the Week-1 experiment
+// `experiments/e02-base-url-relay` testing whether a localhost HTTP server
+// can stand in for the real Anthropic / OpenAI APIs with intact SSE. That
+// risk was validated for the headline endpoints; the experiment's README
+// is preserved at `experiments/e02-base-url-relay/README.md` as the
+// historical record.
 
 pub mod handler;
 

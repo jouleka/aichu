@@ -2,7 +2,7 @@
 
 Local Rust proxy that redacts secrets from prompts sent to AI coding agents (Claude Code, Codex, OpenCode, Cursor CLI), then restores them in responses.
 
-> **Status:** Week 1 risks validated. Production code has begun (`crates/proxy-core`, `crates/proxy-mitm`) and is wired through both proxy modes (`crates/proxy-mitm`, `experiments/e02-base-url-relay`). The end-to-end redaction round-trip works against real Anthropic traffic through both modes. See [Threat model](#threat-model) for guarantees + known limitations.
+> **Status:** Week 1 risks validated. Production code shipped: `crates/proxy-core` (redaction), `crates/proxy-mitm` (Mode B), `crates/proxy-server` (Mode A), `crates/cli` (the `aichu` binary). End-to-end redaction round-trip works against real Anthropic traffic through both proxy modes. See [Threat model](#threat-model) for guarantees + known limitations.
 
 ## Why this exists
 
@@ -50,12 +50,16 @@ rm -rf ~/.aichu  # remove cert + key files
 
 ## Running an experiment
 
+Only `e03-placeholder-eval` remains in `experiments/` — `e01` and `e02`
+have graduated to `crates/proxy-mitm/` and `crates/proxy-server/`
+respectively. To run the placeholder-preservation harness:
+
 ```bash
-cd experiments/e02-base-url-relay
+cd experiments/e03-placeholder-eval
 cargo run --release
 ```
 
-Each experiment is its own binary crate. Workspace-level `cargo build` builds everything. Note: `e01-hudsucker-mitm` has graduated to `crates/proxy-mitm/` and is now consumed as a library by the `aichu` CLI (`crates/cli/`).
+Workspace-level `cargo build` builds everything.
 
 ## Project structure
 
@@ -68,10 +72,12 @@ aichu/
 │   └── build-plan.md       # full architectural plan
 ├── crates/
 │   ├── proxy-core/         # detection + redaction + reverse (used by both modes)
-│   └── proxy-mitm/         # Mode B: HTTPS MITM with on-the-fly rcgen CA (graduated from e01)
+│   ├── proxy-mitm/         # Mode B: HTTPS MITM with on-the-fly rcgen CA (graduated from e01)
+│   ├── proxy-server/       # Mode A: localhost HTTP server, base-URL relay (graduated from e02)
+│   └── cli/                # the `aichu` binary
 └── experiments/            # week-1 risk-validation crates
     ├── e01-hudsucker-mitm/ # historical record only (code graduated to crates/proxy-mitm)
-    ├── e02-base-url-relay/ # Mode A: HTTP localhost server, base-URL relay
+    ├── e02-base-url-relay/ # historical record only (code graduated to crates/proxy-server)
     └── e03-placeholder-eval/  # harness for measuring placeholder preservation
 ```
 
@@ -79,7 +85,7 @@ aichu/
 
 - `crates/proxy-core/`   — redaction pipeline, placeholder map (shared) ✅ shipped
 - `crates/proxy-mitm/`   — Mode B: Hudsucker MITM ✅ shipped
-- `crates/proxy-server/` — Mode A: localhost HTTP server, base-URL relay (currently lives in `experiments/e02-base-url-relay/`)
+- `crates/proxy-server/` — Mode A: localhost HTTP server, base-URL relay ✅ shipped
 - `crates/cli/`          — `aichu run | trust | untrust | doctor` ✅ shipped (macOS; Linux/Windows trust automation v1+)
 
 ## v0 scope: CLI tools only
@@ -206,7 +212,7 @@ suspect exposure.
   intervening SSE/JSON framing. The placeholder leaks to the user.
   Phase 2c (per-event SSE-aware reversal) fixes this and is encoded
   as an `#[ignore]`d executable spec in
-  `experiments/e02-base-url-relay/tests/relay_redacts.rs`.
+  `crates/proxy-server/tests/relay_redacts.rs`.
 - **HTTP/2 multiplexing.** Mode B keys the per-request PlaceholderMap
   by `client_addr`. HTTP/2 multiplexed streams share a TCP connection
   (and thus a `client_addr`), so two truly concurrent requests on one

@@ -590,22 +590,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "92773504d58c093f6de2459af4af33faa518c13451eb8f2b5698ed3d36e7c813"
 
 [[package]]
-name = "e02-base-url-relay"
-version = "0.0.0"
-dependencies = [
- "anyhow",
- "axum",
- "bytes",
- "futures-util",
- "proxy-core",
- "reqwest",
- "serde_json",
- "tokio",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
 name = "e03-placeholder-eval"
 version = "0.0.0"
 dependencies = [
@@ -1657,6 +1641,21 @@ dependencies = [
  "reqwest",
  "serde_json",
  "tempfile",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "proxy-server"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "bytes",
+ "futures-util",
+ "proxy-core",
+ "reqwest",
+ "serde_json",
  "tokio",
  "tracing",
 ]
