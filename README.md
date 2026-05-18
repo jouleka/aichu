@@ -220,10 +220,17 @@ suspect exposure.
   (and thus a `client_addr`), so two truly concurrent requests on one
   connection could race. Not observed in practice; documented in
   `crates/proxy-mitm/src/handler.rs`.
-- **Map leak on dropped connections.** If `handle_response` is never
-  called (TLS error, client cancellation, upstream timeout), the
-  HashMap entry for that `client_addr` is orphaned. Long-running
-  proxies accumulate entries until restart.
+- **Orphaned-entry cleanup is sweep-based, not push-based.** If
+  `handle_response` never runs (TLS error, client cancellation,
+  upstream timeout), the HashMap entry for that `client_addr` would
+  otherwise linger forever. v0 evicts entries older than 15 minutes
+  via an opportunistic sweep on every prompt-endpoint request
+  (`crates/proxy-mitm/src/handler.rs::sweep_stale`). Worst-case
+  memory: roughly `request_rate × orphan_rate × 15 min` entries at a
+  few KB each. For a localhost single-user proxy that's typically
+  zero; under sustained pathological churn it could reach the low
+  thousands transiently before the next sweep — single-digit MB at
+  most.
 - **No streaming UX when secrets are present** (Mode B + most of Mode
   A SSE). When the prompt contains a secret, the proxy buffers the
   whole upstream response before reversing — streaming-UX cost
