@@ -5,9 +5,13 @@
 //
 // v0 surface:
 //   - `aichu` / `aichu run`   — start the proxy (default)
-//   - `aichu trust`           — install the local CA into the macOS System keychain
-//   - `aichu untrust`         — remove the local CA from the macOS System keychain
+//   - `aichu trust`           — install the local CA into the OS trust store
+//   - `aichu untrust`         — remove the local CA from the OS trust store
 //   - `aichu doctor`          — diagnose common setup issues
+//
+// Trust automation is implemented for macOS (System keychain) and
+// Debian-family Linux (`/usr/local/share/ca-certificates/`); other OSes
+// get a bail with manual instructions.
 //
 // Subcommands are NEVER stubbed — no speculative code (CLAUDE.md Rule 2).
 
@@ -33,11 +37,13 @@ struct Cli {
 enum Commands {
     /// Start the proxy on 127.0.0.1:8788 (default if no subcommand given).
     Run,
-    /// Install the local CA into the macOS System keychain (requires sudo).
+    /// Install the local CA into the OS trust store (macOS System keychain
+    /// or Debian-family /usr/local/share/ca-certificates; requires sudo).
     Trust,
-    /// Remove the local CA from the macOS System keychain (requires sudo).
+    /// Remove the local CA from the OS trust store (macOS or Debian-family
+    /// Linux; requires sudo).
     Untrust,
-    /// Diagnose common setup issues (CA presence, keychain install, HTTPS_PROXY, port).
+    /// Diagnose common setup issues (CA presence, trust-store install, HTTPS_PROXY, port).
     Doctor,
 }
 
@@ -149,20 +155,144 @@ fn handle_untrust() -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(target_os = "macos"))]
+// ---- Linux trust automation (Debian-family only, v0) ---------------------
+
+/// On Debian-family distros, certs in this directory are picked up by
+/// `update-ca-certificates` and concatenated into the system bundle at
+/// `/etc/ssl/certs/ca-certificates.crt`. `.crt` extension is mandatory
+/// (the Debian update tool ignores other extensions in this dir).
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+const LINUX_DEBIAN_CERT_DEST: &str = "/usr/local/share/ca-certificates/aichu-ca.crt";
+
+/// Path consulted to detect whether we're on a Debian-family distro.
+/// Shipped by the mandatory `base-files` package on Debian, Ubuntu,
+/// Mint, Pop!_OS, Kali, Raspberry Pi OS, elementary, Zorin, MX,
+/// antiX, Deepin, Parrot, Devuan, PureOS. No known non-Debian distro
+/// ships this file.
+///
+/// Compiled on every target so the `is_debian_family` unit tests can
+/// run cross-OS; only the Linux handlers actually read it at runtime.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+const LINUX_DEBIAN_SENTINEL: &str = "/etc/debian_version";
+
+#[cfg(target_os = "linux")]
+fn handle_trust() -> Result<()> {
+    let cert_src = ca_dir()?.join(proxy_mitm::ca::CERT_FILENAME);
+    if !cert_src.exists() {
+        anyhow::bail!(
+            "CA not generated yet — run `aichu run` once to create it at {}, \
+             then re-run `aichu trust`",
+            cert_src.display()
+        );
+    }
+    if !is_debian_family(|p| Path::new(p).exists()) {
+        anyhow::bail!(
+            "`aichu trust` on Linux currently supports Debian-family distros \
+             only (Debian, Ubuntu, Mint, Pop!_OS, Kali, etc.). For \
+             RHEL/Fedora/Arch/Alpine: copy {} into your distro's trust-anchor \
+             directory and run the appropriate update command \
+             (`update-ca-trust extract`, `trust anchor`, etc.).",
+            cert_src.display()
+        );
+    }
+    let mut cp = linux_trust_copy_command(&cert_src, Path::new(LINUX_DEBIAN_CERT_DEST));
+    tracing::info!(
+        "copying CA into the system trust source — sudo will prompt for your password (src: {})",
+        cert_src.display()
+    );
+    run_or_bail(&mut cp, "CA copy")?;
+    let mut upd = linux_trust_update_command();
+    tracing::info!("rebuilding system trust bundle (update-ca-certificates)...");
+    run_or_bail(&mut upd, "trust update")?;
+    tracing::info!("CA installed into the system trust store ✓");
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn handle_untrust() -> Result<()> {
+    if !is_debian_family(|p| Path::new(p).exists()) {
+        anyhow::bail!(
+            "`aichu untrust` on Linux currently supports Debian-family distros \
+             only. For other distros, remove the CA manually and re-run your \
+             distro's trust-update command."
+        );
+    }
+    let mut rm = linux_untrust_remove_command(Path::new(LINUX_DEBIAN_CERT_DEST));
+    tracing::info!(
+        "removing CA from {} — sudo will prompt for your password",
+        LINUX_DEBIAN_CERT_DEST
+    );
+    run_or_bail(&mut rm, "CA removal")?;
+    let mut upd = linux_trust_update_command();
+    tracing::info!("rebuilding system trust bundle (update-ca-certificates)...");
+    run_or_bail(&mut upd, "trust update")?;
+    tracing::info!("CA removed from the system trust store ✓");
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn handle_trust() -> Result<()> {
     anyhow::bail!(
-        "`aichu trust` is macOS-only in v0; for Linux/Windows, install \
-         `~/.aichu/ca/aichu-ca.pem` into your platform's root store manually"
+        "`aichu trust` is macOS- and Linux-only in v0. On Windows, install \
+         `~/.aichu/ca/aichu-ca.pem` into the Local Machine \\ Trusted Root \
+         Certification Authorities store via `certutil -addstore root <pem>` \
+         from an elevated shell."
     )
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn handle_untrust() -> Result<()> {
     anyhow::bail!(
-        "`aichu untrust` is macOS-only in v0; remove the CA manually from \
-         your platform's root store"
+        "`aichu untrust` is macOS- and Linux-only in v0. On Windows, remove \
+         the CA via `certutil -delstore root \"aichu local proxy CA\"` from \
+         an elevated shell."
     )
+}
+
+/// Detect whether we're on a Debian-family Linux distro by checking for the
+/// presence of `/etc/debian_version`. Pure — `exists` is injected so tests
+/// can drive the both-branches behavior deterministically.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn is_debian_family<F: Fn(&str) -> bool>(exists: F) -> bool {
+    exists(LINUX_DEBIAN_SENTINEL)
+}
+
+/// Build `sudo install -m 644 <src> <dest>`. We use `install(1)` rather
+/// than `cp` so the destination mode is explicit in the argv — readers
+/// (and future maintainers) don't have to reason about how `cp` and the
+/// running umask interact, and the cert stays world-readable regardless
+/// of how the source file's mode is set today or in the future. (Today
+/// `aichu-ca.pem` is 0o644 from `fs::write`; the key file is 0o600, but
+/// only the cert is ever passed here.)
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn linux_trust_copy_command(cert_src: &Path, cert_dest: &Path) -> Command {
+    let mut cmd = Command::new("sudo");
+    cmd.arg("install")
+        .arg("-m")
+        .arg("644")
+        .arg(cert_src)
+        .arg(cert_dest);
+    cmd
+}
+
+/// Build `sudo update-ca-certificates`. Idempotent — runs even if no source
+/// changed; on Debian it diffs the source dirs against the bundle and only
+/// rewrites when needed.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn linux_trust_update_command() -> Command {
+    let mut cmd = Command::new("sudo");
+    cmd.arg("update-ca-certificates");
+    cmd
+}
+
+/// Build `sudo rm -f <cert_dest>`. The `-f` flag means rm succeeds (exit 0)
+/// even if the file is already gone — makes `aichu untrust` idempotent
+/// against a half-cleaned-up state.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn linux_untrust_remove_command(cert_dest: &Path) -> Command {
+    let mut cmd = Command::new("sudo");
+    cmd.arg("rm").arg("-f").arg(cert_dest);
+    cmd
 }
 
 /// Build `sudo security add-trusted-cert -d -r trustRoot -k <keychain> <cert>`.
@@ -200,18 +330,20 @@ fn untrust_command(common_name: &str, keychain: &Path) -> Command {
 }
 
 /// Spawn a `Command` synchronously, bail with the original exit code if it
-/// fails. Centralized so trust + untrust report errors the same way.
-#[cfg(target_os = "macos")]
+/// fails. Centralized so trust + untrust report errors the same way on
+/// every platform where the live handler invokes a subprocess.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn run_or_bail(cmd: &mut Command, what: &str) -> Result<()> {
     let status = cmd
         .status()
         .with_context(|| format!("invoke `sudo` for {what}"))?;
     if !status.success() {
-        // `security(1)` inherits our stdio, so its own error has already
-        // printed to the user's terminal above this bail message — point
-        // them there rather than promising tracing detail we don't have.
+        // The subprocess (security(1), install(1), update-ca-certificates,
+        // rm) inherits our stdio, so its own error has already printed to
+        // the user's terminal above this bail message — point them there
+        // rather than promising tracing detail we don't have.
         anyhow::bail!(
-            "{what} failed (exit code {:?}); see `security` output above for the cause",
+            "{what} failed (exit code {:?}); see subprocess output above for the cause",
             status.code()
         );
     }
@@ -303,7 +435,29 @@ fn check_proxy_port_listening(addr: SocketAddr) -> CheckResult {
     }
 }
 
-/// Check 4 (macOS only): does the CA appear in the System keychain?
+/// Check 4 (Debian-family Linux only): does the CA cert exist at the
+/// destination path that `update-ca-certificates` picks up? File
+/// existence is a sufficient signal — if the file is there,
+/// `update-ca-certificates` would have folded it into
+/// `/etc/ssl/certs/ca-certificates.crt`. Verifying the *bundle*
+/// directly would require parsing PEM concatenations, which is more
+/// work than a check this proxy-y needs.
+///
+/// Pure file-existence check, no subprocess. Compiles on every target
+/// so the unit test runs cross-OS.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn check_linux_debian_trust_source(cert_dest: &Path) -> CheckResult {
+    if cert_dest.exists() {
+        CheckResult::Ok(format!("CA present at {}", cert_dest.display()))
+    } else {
+        CheckResult::Fail {
+            message: format!("CA not found at {}", cert_dest.display()),
+            hint: "run `aichu trust` to install it (requires sudo)".into(),
+        }
+    }
+}
+
+/// Check 5 (macOS only): does the CA appear in the System keychain?
 /// Uses `security find-certificate -c <CN> <keychain>` which is
 /// read-only and does not prompt for sudo. Exit 0 = found, non-zero
 /// = not found.
@@ -404,6 +558,11 @@ fn handle_doctor() -> Result<()> {
                 proxy_mitm::ca::COMMON_NAME,
                 Path::new(MACOS_SYSTEM_KEYCHAIN),
             ),
+        ),
+        #[cfg(target_os = "linux")]
+        (
+            "CA in trust source (Debian-family)",
+            check_linux_debian_trust_source(Path::new(LINUX_DEBIAN_CERT_DEST)),
         ),
     ];
 
@@ -593,28 +752,126 @@ mod tests {
         assert_eq!(args[3], "weird CN with spaces & symbols!");
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     #[test]
-    fn handle_trust_returns_unsupported_on_non_macos() {
-        // The non-macOS error must name the platform constraint so users
-        // know it's deliberate, not a missing dependency. Compare-by-
-        // substring is intentionally loose to allow message tweaks.
-        let err = handle_trust().expect_err("non-macOS trust should error");
+    fn handle_trust_returns_unsupported_on_unsupported_os() {
+        // The unsupported-OS error must name the platform constraint so
+        // users know it's deliberate, not a missing dependency. Compare-
+        // by-substring is intentionally loose to allow message tweaks.
+        // Currently fires only on Windows + BSDs + Solaris.
+        let err = handle_trust().expect_err("unsupported-OS trust should error");
         let msg = err.to_string();
         assert!(
-            msg.contains("macOS"),
-            "non-macOS trust error should mention macOS: {msg}"
+            msg.contains("macOS") && msg.contains("Linux"),
+            "unsupported-OS trust error should mention macOS and Linux: {msg}"
         );
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     #[test]
-    fn handle_untrust_returns_unsupported_on_non_macos() {
-        let err = handle_untrust().expect_err("non-macOS untrust should error");
+    fn handle_untrust_returns_unsupported_on_unsupported_os() {
+        let err = handle_untrust().expect_err("unsupported-OS untrust should error");
         let msg = err.to_string();
         assert!(
-            msg.contains("macOS"),
-            "non-macOS untrust error should mention macOS: {msg}"
+            msg.contains("macOS") && msg.contains("Linux"),
+            "unsupported-OS untrust error should mention macOS and Linux: {msg}"
+        );
+    }
+
+    // ---- Linux trust automation (Debian-family) -----------------------------
+
+    #[test]
+    fn is_debian_family_true_when_sentinel_file_exists() {
+        // The sentinel is `/etc/debian_version`. The function takes an
+        // `exists` closure precisely so this test doesn't depend on the
+        // host filesystem.
+        let r = is_debian_family(|p| p == LINUX_DEBIAN_SENTINEL);
+        assert!(r, "should detect Debian family when sentinel exists");
+    }
+
+    #[test]
+    fn is_debian_family_false_when_sentinel_file_absent() {
+        let r = is_debian_family(|_| false);
+        assert!(!r, "should NOT detect Debian family when sentinel is absent");
+    }
+
+    #[test]
+    fn linux_trust_copy_command_uses_install_with_644_mode() {
+        // Pin the exact argv. Using `install(1)` rather than `cp` is a
+        // deliberate choice (explicit mode 644 instead of inheriting
+        // ~/.aichu/ca/'s mode 600 which would brick parsing).
+        let cmd = linux_trust_copy_command(
+            Path::new("/home/me/.aichu/ca/aichu-ca.pem"),
+            Path::new("/usr/local/share/ca-certificates/aichu-ca.crt"),
+        );
+        assert_eq!(cmd.get_program(), "sudo");
+        let args: Vec<&str> = cmd.get_args().filter_map(|a| a.to_str()).collect();
+        assert_eq!(
+            args,
+            vec![
+                "install",
+                "-m",
+                "644",
+                "/home/me/.aichu/ca/aichu-ca.pem",
+                "/usr/local/share/ca-certificates/aichu-ca.crt",
+            ]
+        );
+    }
+
+    #[test]
+    fn linux_trust_update_command_runs_update_ca_certificates() {
+        let cmd = linux_trust_update_command();
+        assert_eq!(cmd.get_program(), "sudo");
+        let args: Vec<&str> = cmd.get_args().filter_map(|a| a.to_str()).collect();
+        assert_eq!(args, vec!["update-ca-certificates"]);
+    }
+
+    #[test]
+    fn check_linux_debian_trust_source_ok_when_cert_present() {
+        // File existence at the destination path is the signal that
+        // `aichu trust` ran successfully — `update-ca-certificates`
+        // would have folded the cert into the bundle on its last run.
+        let dir = tempfile::TempDir::new().unwrap();
+        let dest = dir.path().join("aichu-ca.crt");
+        std::fs::write(&dest, "fake-cert-bytes").unwrap();
+        assert!(matches!(
+            check_linux_debian_trust_source(&dest),
+            CheckResult::Ok(_)
+        ));
+    }
+
+    #[test]
+    fn check_linux_debian_trust_source_fails_when_cert_absent() {
+        // Absence means `aichu trust` hasn't run (or `aichu untrust`
+        // removed it). The hint must point at `aichu trust`.
+        let dir = tempfile::TempDir::new().unwrap();
+        let dest = dir.path().join("aichu-ca.crt"); // intentionally not created
+        match check_linux_debian_trust_source(&dest) {
+            CheckResult::Fail { hint, .. } => {
+                assert!(
+                    hint.contains("aichu trust"),
+                    "hint should point at `aichu trust`: {hint}"
+                );
+            }
+            other => panic!("expected Fail, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn linux_untrust_remove_command_uses_rm_f_for_idempotency() {
+        // The `-f` flag means rm succeeds even if the cert is already
+        // gone — keeps `aichu untrust` idempotent against a partially-
+        // cleaned-up state. Locking the flag here so a future "let's
+        // be defensive and drop `-f`" reflex would surface as a test
+        // failure.
+        let cmd = linux_untrust_remove_command(Path::new(
+            "/usr/local/share/ca-certificates/aichu-ca.crt",
+        ));
+        assert_eq!(cmd.get_program(), "sudo");
+        let args: Vec<&str> = cmd.get_args().filter_map(|a| a.to_str()).collect();
+        assert_eq!(
+            args,
+            vec!["rm", "-f", "/usr/local/share/ca-certificates/aichu-ca.crt"]
         );
     }
 
