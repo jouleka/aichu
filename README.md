@@ -22,6 +22,29 @@ The build plan identifies three risks that must be validated before committing t
 
 Each experiment's README records its goal, run instructions, and result (✅/❌ with notes) as it completes.
 
+## Running aichu
+
+```bash
+# Build + install the binary.
+cargo install --path crates/cli
+
+# One-time: install the local CA into the macOS System keychain.
+# (sudo prompts for your login password; macOS-only in v0.)
+aichu trust
+
+# Run the proxy. Listens on 127.0.0.1:8788; Ctrl-C to stop.
+aichu          # equivalent to `aichu run`
+
+# In another shell, point a coding agent at the proxy.
+export HTTPS_PROXY=http://127.0.0.1:8788
+export NODE_EXTRA_CA_CERTS=$HOME/.aichu/ca/aichu-ca.pem
+claude         # or codex, opencode, cursor-agent, etc.
+
+# To clean up:
+aichu untrust  # remove CA from System keychain
+rm -rf ~/.aichu  # remove cert + key files
+```
+
 ## Running an experiment
 
 ```bash
@@ -29,7 +52,7 @@ cd experiments/e02-base-url-relay
 cargo run --release
 ```
 
-Each experiment is its own binary crate. Workspace-level `cargo build` builds everything. Note: `e01-hudsucker-mitm` has graduated to `crates/proxy-mitm/` and is now consumed as a library; the `aichu` CLI binary that wires it together is forthcoming (see `crates/cli/` in the layout below).
+Each experiment is its own binary crate. Workspace-level `cargo build` builds everything. Note: `e01-hudsucker-mitm` has graduated to `crates/proxy-mitm/` and is now consumed as a library by the `aichu` CLI (`crates/cli/`).
 
 ## Project structure
 
@@ -54,7 +77,7 @@ aichu/
 - `crates/proxy-core/`   — redaction pipeline, placeholder map (shared) ✅ shipped
 - `crates/proxy-mitm/`   — Mode B: Hudsucker MITM ✅ shipped
 - `crates/proxy-server/` — Mode A: localhost HTTP server, base-URL relay (currently lives in `experiments/e02-base-url-relay/`)
-- `crates/cli/`          — `aichu run | trust | untrust | doctor` (not started)
+- `crates/cli/`          — `aichu run | trust | untrust` ✅ shipped (macOS); `doctor` pending
 
 ## v0 scope: CLI tools only
 
@@ -158,7 +181,7 @@ You are NOT trusting:
 
 - A system-wide CA install. Mode B mints a per-machine CA and asks the
   user to install it into the system trust store via an explicit
-  `aichu trust` command (planned; not yet implemented). For Mode A, no
+  `aichu trust` command (macOS shipped; Linux/Windows v1+). For Mode A, no
   CA is installed at all.
 - Any third-party server. The proxy contacts your configured model
   provider only.

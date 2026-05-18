@@ -18,6 +18,12 @@ use hudsucker::rustls::crypto::aws_lc_rs;
 pub const CERT_FILENAME: &str = "aichu-ca.pem";
 pub const KEY_FILENAME: &str = "aichu-ca.key";
 
+/// X.509 Common Name baked into the self-signed CA. The `aichu untrust`
+/// CLI uses this to locate the cert in the system keychain for removal,
+/// so it must stay stable across versions — changing this string would
+/// orphan installs by anyone who ran `aichu trust` on an earlier build.
+pub const COMMON_NAME: &str = "aichu local proxy CA";
+
 /// A loaded or freshly-generated local CA, ready to back a hudsucker proxy.
 pub struct Ca {
     /// The hudsucker authority that signs leaf certs for intercepted hosts.
@@ -69,7 +75,7 @@ fn generate_ca() -> Result<(String, String)> {
     let mut params = CertificateParams::new(Vec::<String>::new())
         .context("init CA certificate params")?;
     let mut dn = DistinguishedName::new();
-    dn.push(DnType::CommonName, "aichu local proxy CA");
+    dn.push(DnType::CommonName, COMMON_NAME);
     dn.push(DnType::OrganizationName, "aichu");
     params.distinguished_name = dn;
     // Constrained(0): this CA can sign leaf certificates but cannot mint
