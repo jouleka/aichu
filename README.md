@@ -40,6 +40,9 @@ export HTTPS_PROXY=http://127.0.0.1:8788
 export NODE_EXTRA_CA_CERTS=$HOME/.aichu/ca/aichu-ca.pem
 claude         # or codex, opencode, cursor-agent, etc.
 
+# Troubleshooting:
+aichu doctor   # diagnoses CA, keychain, HTTPS_PROXY, and proxy-port issues
+
 # To clean up:
 aichu untrust  # remove CA from System keychain
 rm -rf ~/.aichu  # remove cert + key files
@@ -77,7 +80,7 @@ aichu/
 - `crates/proxy-core/`   — redaction pipeline, placeholder map (shared) ✅ shipped
 - `crates/proxy-mitm/`   — Mode B: Hudsucker MITM ✅ shipped
 - `crates/proxy-server/` — Mode A: localhost HTTP server, base-URL relay (currently lives in `experiments/e02-base-url-relay/`)
-- `crates/cli/`          — `aichu run | trust | untrust` ✅ shipped (macOS); `doctor` pending
+- `crates/cli/`          — `aichu run | trust | untrust | doctor` ✅ shipped (macOS; Linux/Windows trust automation v1+)
 
 ## v0 scope: CLI tools only
 

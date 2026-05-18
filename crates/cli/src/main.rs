@@ -7,14 +7,15 @@
 //   - `aichu` / `aichu run`   — start the proxy (default)
 //   - `aichu trust`           — install the local CA into the macOS System keychain
 //   - `aichu untrust`         — remove the local CA from the macOS System keychain
+//   - `aichu doctor`          — diagnose common setup issues
 //
-// `aichu doctor` lands in a follow-up slice. Subcommands are NEVER stubbed —
-// no speculative code (CLAUDE.md Rule 2).
+// Subcommands are NEVER stubbed — no speculative code (CLAUDE.md Rule 2).
 
 use std::ffi::OsString;
-use std::net::SocketAddr;
+use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -36,6 +37,8 @@ enum Commands {
     Trust,
     /// Remove the local CA from the macOS System keychain (requires sudo).
     Untrust,
+    /// Diagnose common setup issues (CA presence, keychain install, HTTPS_PROXY, port).
+    Doctor,
 }
 
 impl Cli {
@@ -55,6 +58,7 @@ async fn main() -> Result<()> {
         Commands::Run => run().await,
         Commands::Trust => handle_trust(),
         Commands::Untrust => handle_untrust(),
+        Commands::Doctor => handle_doctor(),
     }
 }
 
@@ -214,6 +218,223 @@ fn run_or_bail(cmd: &mut Command, what: &str) -> Result<()> {
     Ok(())
 }
 
+// -----------------------------------------------------------------------------
+// `aichu doctor` — read-only setup diagnostics.
+// -----------------------------------------------------------------------------
+
+/// Outcome of one diagnostic check. `Warn` and `Fail` differ on severity:
+/// `Warn` is "something the user probably wants to know" (e.g. HTTPS_PROXY
+/// not set in this shell), `Fail` is "doctor reports the binary cannot
+/// function correctly until this is fixed" (e.g. CA not generated).
+#[derive(Debug, PartialEq)]
+enum CheckResult {
+    Ok(String),
+    Warn { message: String, hint: String },
+    Fail { message: String, hint: String },
+}
+
+/// Check 1: does the CA cert file exist on disk? Without this, `aichu run`
+/// will generate one on first invocation — but if the user already ran
+/// `aichu trust`, *this* file is the one they trusted, and a regenerated
+/// CA would orphan that install.
+fn check_ca_present(ca_dir: &Path) -> CheckResult {
+    let cert_path = ca_dir.join(proxy_mitm::ca::CERT_FILENAME);
+    let key_path = ca_dir.join(proxy_mitm::ca::KEY_FILENAME);
+    match (cert_path.exists(), key_path.exists()) {
+        (true, true) => CheckResult::Ok(format!("CA present at {}", cert_path.display())),
+        (false, false) => CheckResult::Fail {
+            message: format!("CA not found at {}", cert_path.display()),
+            hint: "run `aichu run` once to generate the CA, then `aichu trust` to install it \
+                   (if you previously trusted a now-deleted CA, run `aichu untrust` first to \
+                   avoid an orphaned keychain entry)"
+                .into(),
+        },
+        (true, false) => CheckResult::Fail {
+            message: format!("CA cert exists but private key is missing at {}", key_path.display()),
+            hint: "the CA is unusable — `rm` the cert and run `aichu run` to regenerate (you'll need to `aichu untrust` + `aichu trust` again)".into(),
+        },
+        (false, true) => CheckResult::Fail {
+            message: format!("CA private key exists but cert is missing at {}", cert_path.display()),
+            hint: "the CA is unusable — `rm` the key and run `aichu run` to regenerate".into(),
+        },
+    }
+}
+
+/// Check 2: is `HTTPS_PROXY` set in this shell? Without it, coding agents
+/// won't route traffic through aichu — the proxy can be running and
+/// trusted, and prompts will still flow unredacted to the model provider.
+///
+/// We don't try to parse or validate the URL — heuristic guessing about
+/// "right" URLs would mask real misconfigurations behind opinions. A set
+/// value reports Ok with the value displayed; the user reads it and
+/// decides if it points where they meant.
+fn check_https_proxy<F>(env: F) -> CheckResult
+where
+    F: Fn(&str) -> Option<OsString>,
+{
+    match env("HTTPS_PROXY").or_else(|| env("https_proxy")) {
+        Some(value) => CheckResult::Ok(format!(
+            "HTTPS_PROXY={}",
+            value.to_string_lossy()
+        )),
+        None => CheckResult::Warn {
+            message: "HTTPS_PROXY is not set in this shell".into(),
+            hint: "export HTTPS_PROXY=http://127.0.0.1:8788 (the proxy still works for any process that DOES have it set)".into(),
+        },
+    }
+}
+
+/// Check 3: is anything listening on the proxy port? Uses a short
+/// `TcpStream::connect_timeout` — if something accepts the connection,
+/// the port is bound (which is what we want); ECONNREFUSED means
+/// nothing's there (the proxy isn't running).
+///
+/// We can't tell from the outside whether the listener is actually
+/// aichu vs. some other binding (`nc -l 8788` would also pass). That
+/// ambiguity is acceptable — the user is asking "is my proxy up?",
+/// not "prove this is aichu specifically".
+fn check_proxy_port_listening(addr: SocketAddr) -> CheckResult {
+    match TcpStream::connect_timeout(&addr, Duration::from_millis(200)) {
+        Ok(_) => CheckResult::Ok(format!("something is listening on {addr}")),
+        Err(_) => CheckResult::Warn {
+            message: format!("nothing is listening on {addr}"),
+            hint: "run `aichu` (or `aichu run`) in another shell to start the proxy".into(),
+        },
+    }
+}
+
+/// Check 4 (macOS only): does the CA appear in the System keychain?
+/// Uses `security find-certificate -c <CN> <keychain>` which is
+/// read-only and does not prompt for sudo. Exit 0 = found, non-zero
+/// = not found.
+#[cfg(target_os = "macos")]
+fn check_keychain_has_ca(common_name: &str, keychain: &Path) -> CheckResult {
+    let mut cmd = find_certificate_command(common_name, keychain);
+    // Capture both streams so we can choose what to surface to the user.
+    // `Output` gives us stderr; we only forward it on the *unexpected*
+    // failure path (e.g. keychain file missing). The normal "not found"
+    // case still maps to a clean Fail with a `aichu trust` hint.
+    let output = match cmd.output() {
+        Ok(o) => o,
+        Err(e) => {
+            return CheckResult::Fail {
+                message: format!("could not invoke `security find-certificate`: {e}"),
+                hint: "is the macOS Security framework command-line available? (`which security`)"
+                    .into(),
+            };
+        }
+    };
+    interpret_find_certificate_output(&output, common_name)
+}
+
+/// Build `security find-certificate -c <common_name> <keychain>`. Pure
+/// so tests can pin the argv shape without spawning. (No `sudo`: this
+/// is a read-only operation; the keychain itself allows lookups by
+/// any local user.)
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn find_certificate_command(common_name: &str, keychain: &Path) -> Command {
+    let mut cmd = Command::new("security");
+    cmd.arg("find-certificate")
+        .arg("-c")
+        .arg(common_name)
+        .arg(keychain);
+    cmd
+}
+
+/// Pure interpretation of `find-certificate`'s output. Three branches:
+///   1. exit 0 → cert present.
+///   2. exit non-zero with the standard "could not be found" stderr → cert
+///      not installed; suggest `aichu trust`.
+///   3. exit non-zero with any other stderr → surface that stderr in the
+///      Fail message. Without this branch a broken keychain (missing file,
+///      permissions issue) would be reported as "not installed" and the
+///      user would chase the wrong fix.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn interpret_find_certificate_output(
+    output: &std::process::Output,
+    common_name: &str,
+) -> CheckResult {
+    if output.status.success() {
+        return CheckResult::Ok(format!("CA \"{common_name}\" present in System keychain"));
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    // `security find-certificate -c <CN>` emits this exact phrasing for
+    // "no matching cert" — anything else is an environmental problem.
+    if stderr.contains("could not be found") {
+        CheckResult::Fail {
+            message: format!("CA \"{common_name}\" is not installed in the System keychain"),
+            hint: "run `aichu trust` to install it (will prompt for sudo)".into(),
+        }
+    } else {
+        CheckResult::Fail {
+            message: format!(
+                "`security find-certificate` failed unexpectedly: {}",
+                stderr.trim()
+            ),
+            hint: "check that /Library/Keychains/System.keychain is accessible".into(),
+        }
+    }
+}
+
+/// Run every diagnostic and surface results. Returns `Err` if any check
+/// reports `Fail` so the process exit code is non-zero — `Warn`s alone
+/// keep doctor exiting 0 (the user might intentionally have HTTPS_PROXY
+/// unset in this particular shell while testing).
+fn handle_doctor() -> Result<()> {
+    println!("aichu doctor — checking your setup:\n");
+
+    let ca_dir = ca_dir()?;
+    let mut any_fail = false;
+    let mut any_warn = false;
+
+    let checks: Vec<(&str, CheckResult)> = vec![
+        ("CA on disk", check_ca_present(&ca_dir)),
+        (
+            "HTTPS_PROXY in this shell",
+            check_https_proxy(|k| std::env::var_os(k)),
+        ),
+        (
+            "proxy port reachable",
+            check_proxy_port_listening("127.0.0.1:8788".parse().expect("hardcoded addr parses")),
+        ),
+        #[cfg(target_os = "macos")]
+        (
+            "CA in System keychain (macOS)",
+            check_keychain_has_ca(
+                proxy_mitm::ca::COMMON_NAME,
+                Path::new(MACOS_SYSTEM_KEYCHAIN),
+            ),
+        ),
+    ];
+
+    for (label, result) in &checks {
+        match result {
+            CheckResult::Ok(msg) => println!("  ✓ {label}: {msg}"),
+            CheckResult::Warn { message, hint } => {
+                println!("  ! {label}: {message}");
+                println!("      hint: {hint}");
+                any_warn = true;
+            }
+            CheckResult::Fail { message, hint } => {
+                println!("  ✗ {label}: {message}");
+                println!("      hint: {hint}");
+                any_fail = true;
+            }
+        }
+    }
+
+    println!();
+    if any_fail {
+        anyhow::bail!("one or more checks failed — see above")
+    } else if any_warn {
+        println!("all critical checks passed; some warnings above.");
+        Ok(())
+    } else {
+        println!("all checks passed ✓");
+        Ok(())
+    }
+}
+
 /// Default aichu data directory: `$HOME/.aichu` on Unix, `%USERPROFILE%\.aichu`
 /// on Windows. Self-contained, easy to nuke (`rm -rf ~/.aichu`).
 fn default_aichu_dir() -> Result<PathBuf> {
@@ -254,11 +475,9 @@ mod tests {
         // Locks the contract: typos in subcommand names must fail loudly,
         // not silently fall through to the default. Surfaces a future
         // regression where `Option<Commands>` swallows clap's error.
-        let result = Cli::try_parse_from(["aichu", "doctor"]);
-        assert!(
-            result.is_err(),
-            "expected `aichu doctor` to error (subcommand not yet implemented)"
-        );
+        // `xyzzy` is a known-never-to-be-a-real-subcommand placeholder.
+        let result = Cli::try_parse_from(["aichu", "xyzzy"]);
+        assert!(result.is_err(), "expected `aichu xyzzy` to error");
     }
 
     #[test]
@@ -397,5 +616,193 @@ mod tests {
             msg.contains("macOS"),
             "non-macOS untrust error should mention macOS: {msg}"
         );
+    }
+
+    // ---- `aichu doctor` checks ------------------------------------------------
+
+    #[test]
+    fn check_ca_present_ok_when_both_files_exist() {
+        // Both cert and key on disk: the proxy can boot and the trust install
+        // (if any) is consistent with what's there.
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join(proxy_mitm::ca::CERT_FILENAME), "fake-cert").unwrap();
+        std::fs::write(dir.path().join(proxy_mitm::ca::KEY_FILENAME), "fake-key").unwrap();
+        assert!(matches!(
+            check_ca_present(dir.path()),
+            CheckResult::Ok(_)
+        ));
+    }
+
+    #[test]
+    fn check_ca_present_fails_when_neither_file_exists() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let result = check_ca_present(dir.path());
+        match result {
+            CheckResult::Fail { hint, .. } => {
+                assert!(hint.contains("aichu run"), "hint should point at `aichu run`: {hint}");
+            }
+            other => panic!("expected Fail, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn check_ca_present_fails_loudly_when_only_one_file_exists() {
+        // Partial state (cert without key, or vice versa) is unrecoverable
+        // — the CA is unusable. Doctor surfaces this as a Fail rather than
+        // letting `aichu run` silently regenerate (which would orphan any
+        // trust install).
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join(proxy_mitm::ca::CERT_FILENAME), "only-cert").unwrap();
+        assert!(matches!(
+            check_ca_present(dir.path()),
+            CheckResult::Fail { .. }
+        ));
+    }
+
+    #[test]
+    fn check_https_proxy_ok_when_uppercase_var_set() {
+        let r = check_https_proxy(|k| match k {
+            "HTTPS_PROXY" => Some("http://127.0.0.1:8788".into()),
+            _ => None,
+        });
+        assert!(matches!(r, CheckResult::Ok(_)));
+    }
+
+    #[test]
+    fn check_https_proxy_falls_back_to_lowercase_var() {
+        // Many shell environments only set `https_proxy` (lowercase, the
+        // libcurl convention). Coding agents that use libcurl-derived
+        // HTTP clients will read it; doctor must too, or it'd warn about
+        // a setup that actually works.
+        let r = check_https_proxy(|k| match k {
+            "https_proxy" => Some("http://127.0.0.1:8788".into()),
+            _ => None,
+        });
+        assert!(matches!(r, CheckResult::Ok(_)));
+    }
+
+    #[test]
+    fn check_https_proxy_warns_when_unset() {
+        // Unset is Warn, not Fail — the proxy might still be useful for
+        // a different shell where the user did export it.
+        let r = check_https_proxy(|_| None);
+        assert!(matches!(r, CheckResult::Warn { .. }));
+    }
+
+    #[test]
+    fn check_proxy_port_listening_ok_when_something_listens() {
+        // Bind a sacrificial listener on a free port and verify the check
+        // sees it. The kernel never re-binds the same ephemeral port
+        // within a single process, so there's no race with the connect.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let r = check_proxy_port_listening(addr);
+        assert!(matches!(r, CheckResult::Ok(_)), "got {r:?}");
+    }
+
+    #[test]
+    fn check_proxy_port_listening_warns_when_nothing_listens() {
+        // Bind, capture the address, drop the listener — within this test's
+        // window no other process is racing for ephemeral ports, so the
+        // connect refuses cleanly. (We can't promise the kernel won't ever
+        // re-issue this port; we promise nothing in *this* test is asking
+        // it to.)
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let r = check_proxy_port_listening(addr);
+        assert!(matches!(r, CheckResult::Warn { .. }), "got {r:?}");
+    }
+
+    #[test]
+    fn find_certificate_command_targets_named_keychain() {
+        // Argv-pin the read-only lookup so any drift (e.g. adding `-Z`
+        // flag or changing keychain path semantics) is caught here, not
+        // by users on a real machine.
+        let cmd = find_certificate_command(
+            "aichu local proxy CA",
+            Path::new("/Library/Keychains/System.keychain"),
+        );
+        assert_eq!(cmd.get_program(), "security");
+        let args: Vec<&str> = cmd.get_args().filter_map(|a| a.to_str()).collect();
+        assert_eq!(
+            args,
+            vec![
+                "find-certificate",
+                "-c",
+                "aichu local proxy CA",
+                "/Library/Keychains/System.keychain",
+            ]
+        );
+        // Crucially: no `sudo` prefix. Read operation, no privilege needed.
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn interpret_find_certificate_output_ok_on_zero_exit() {
+        // Use a real subprocess to construct a known-success Output — `true`
+        // exits 0 with empty stdout/stderr on every POSIX platform.
+        let output = Command::new("true").output().unwrap();
+        let r = interpret_find_certificate_output(&output, "aichu local proxy CA");
+        assert!(matches!(r, CheckResult::Ok(_)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn interpret_find_certificate_output_reports_install_hint_on_normal_not_found() {
+        // Construct an Output that mimics the *expected* failure: exit
+        // non-zero, stderr contains the "could not be found" phrasing.
+        // The hint must point at `aichu trust` so the user takes the
+        // right next action.
+        use std::os::unix::process::ExitStatusExt;
+        let output = std::process::Output {
+            status: std::process::ExitStatus::from_raw(256),
+            stdout: Vec::new(),
+            stderr: b"SecKeychainSearchCopyNext: The specified item could not be found in the keychain.\n".to_vec(),
+        };
+        let r = interpret_find_certificate_output(&output, "aichu local proxy CA");
+        match r {
+            CheckResult::Fail { hint, message } => {
+                assert!(
+                    hint.contains("aichu trust"),
+                    "normal not-found hint should point at `aichu trust`: {hint}"
+                );
+                assert!(
+                    message.contains("not installed"),
+                    "message should describe the install gap: {message}"
+                );
+            }
+            other => panic!("expected Fail, got {other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn interpret_find_certificate_output_surfaces_unexpected_stderr() {
+        // The defensive branch: if stderr says something OTHER than the
+        // canonical "could not be found" phrasing, doctor must NOT
+        // misreport it as "not installed" — the user would chase the
+        // wrong fix (`aichu trust` won't help if the keychain itself is
+        // broken). Verifies the stderr is surfaced in the Fail message.
+        use std::os::unix::process::ExitStatusExt;
+        let output = std::process::Output {
+            status: std::process::ExitStatus::from_raw(256),
+            stdout: Vec::new(),
+            stderr: b"SecKeychainCopyDefault: keychain file does not exist".to_vec(),
+        };
+        let r = interpret_find_certificate_output(&output, "aichu local proxy CA");
+        match r {
+            CheckResult::Fail { message, .. } => {
+                assert!(
+                    message.contains("keychain file does not exist"),
+                    "unexpected stderr should be surfaced: {message}"
+                );
+                assert!(
+                    !message.contains("not installed"),
+                    "unexpected stderr should NOT be reported as 'not installed': {message}"
+                );
+            }
+            other => panic!("expected Fail, got {other:?}"),
+        }
     }
 }

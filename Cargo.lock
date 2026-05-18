@@ -24,6 +24,7 @@ dependencies = [
  "anyhow",
  "clap",
  "proxy-mitm",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",
