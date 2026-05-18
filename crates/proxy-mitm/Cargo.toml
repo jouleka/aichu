@@ -20,6 +20,9 @@ bytes = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 anyhow = { workspace = true }
+# Phase 2c: the SSE-aware streaming reverser wraps the upstream byte
+# stream with futures_util::stream::unfold.
+futures-util = { workspace = true }
 
 [dev-dependencies]
 axum = { workspace = true }

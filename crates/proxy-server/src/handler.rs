@@ -1,5 +1,5 @@
-// Phase-2b relay handlers with outbound redaction + full response-side
-// reversal (non-streaming JSON + buffered SSE).
+// Phase-2c relay handlers with outbound redaction + full response-side
+// reversal (non-streaming JSON + streaming SSE).
 //
 // Request side (Phase 1):
 //   - read inbound body
@@ -7,32 +7,27 @@
 //     with typed placeholders before the body leaves this process
 //   - forward the redacted body upstream
 //
-// Response side (Phase 2a + Phase 2b):
+// Response side (Phase 2a + Phase 2c):
 //
 //   When the outbound pass minted no placeholders (no secrets in the
 //   prompt), the response always streams through unchanged regardless
 //   of content-type — streaming UX preserved for non-secret traffic.
 //
-//   When the outbound pass DID mint placeholders, the response is
-//   buffered, run through `proxy_core::reverse`, and emitted as a
-//   non-streaming body. This applies uniformly to application/json
-//   (Phase 2a) and text/event-stream (Phase 2b).
+//   When the outbound pass DID mint placeholders, the response handling
+//   branches on content type:
 //
-//   Trade-off (Phase 2b): when secrets are in the prompt and the
-//   response is SSE, the user loses streaming UX — the proxy holds
-//   the entire response until it's complete, then delivers it as one
-//   chunk.
+//   - `text/event-stream` (streaming SSE, Phase 2c): the upstream byte
+//     stream is wrapped with `proxy_core::SseReverser`, which parses
+//     events as they arrive, accumulates `text_delta` payloads, holds
+//     back any tail that could be the prefix of an incomplete
+//     placeholder, and emits reversed text downstream event-by-event.
+//     Streaming UX preserved AND cross-event placeholder splits get
+//     reversed correctly.
 //
-//   Known limitation (Phase 2b → Phase 2c): the whole-response
-//   buffering only reverses placeholders that land WHOLLY inside a
-//   single SSE event's `text_delta` payload. If the model fragments a
-//   placeholder across two `content_block_delta` events (e.g. event 1
-//   ends with `«SECRET_AWS_` and event 2 begins with `KEY_001»`), the
-//   bytes between them include JSON/SSE framing (`"}}\n\nevent: ...`)
-//   which breaks the reverse regex's `[A-Z0-9_]+_[0-9]+` character
-//   class. The placeholder stays unreversed and the user sees the
-//   fragments. Phase 2c's per-event SSE-aware reversal fixes both
-//   issues (streaming UX + cross-event split).
+//   - `application/json` and everything else (Phase 2a): the response
+//     is buffered, run through `proxy_core::reverse`, and emitted as a
+//     non-streaming body. A non-streaming endpoint can't lose
+//     streaming UX anyway.
 
 use std::sync::Arc;
 
@@ -44,7 +39,8 @@ use axum::{
     routing::post,
 };
 use bytes::Bytes;
-use proxy_core::PlaceholderMap;
+use futures_util::stream::{self, Stream, StreamExt};
+use proxy_core::{PlaceholderMap, SseReverser};
 use reqwest::Client;
 
 use crate::RelayConfig;
@@ -93,12 +89,14 @@ async fn handle_openai_chat(
 ///   - **No placeholders minted** (no secrets in the prompt) → response
 ///     streams through unchanged regardless of content-type.
 ///     Streaming UX preserved.
-///   - **Placeholders minted** → response is buffered to bytes, run
-///     through `proxy_core::reverse` against the PlaceholderMap, and
-///     emitted as a non-streaming Body. Applies to both
-///     `application/json` and `text/event-stream`. SSE streaming UX
-///     is lost in this case; Phase 2c will restore it via per-event
-///     reversal that doesn't require buffering the whole response.
+///   - **Placeholders minted + `text/event-stream`** → response is
+///     wrapped with `proxy_core::SseReverser` and streamed. Cross-event
+///     placeholder splits get reversed; streaming UX preserved.
+///   - **Placeholders minted, other content types** → response is
+///     buffered to bytes and run through `proxy_core::reverse` once,
+///     then emitted as a non-streaming Body. Applies to
+///     `application/json` and anything else (non-streaming endpoints
+///     can't lose streaming they didn't have).
 async fn forward(client: Client, url: String, req: Request) -> Response<Body> {
     let (parts, body) = req.into_parts();
 
@@ -179,42 +177,57 @@ async fn forward(client: Client, url: String, req: Request) -> Response<Body> {
         // Preserves streaming UX for the common no-secret case.
         Body::from_stream(upstream_resp.bytes_stream())
     } else {
-        // The outbound pass minted at least one placeholder. Buffer
-        // the full response, run the reverse pass, hand back as a
-        // non-streaming Body. Same UTF-8 round-trip and "JSON
-        // delimiters don't appear inside placeholders" invariant we
-        // relied on for the outbound redaction.
-        //
-        // For SSE responses this means losing streaming for the
-        // with-secrets case — see the file header for the Phase 2b
-        // trade-off note.
         let content_type = upstream_headers
             .get("content-type")
             .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
-        match upstream_resp.bytes().await {
-            Ok(bytes) => match std::str::from_utf8(&bytes) {
-                Ok(s) => {
-                    let restored = proxy_core::reverse(s, &placeholder_map);
-                    tracing::info!(
-                        placeholders = placeholder_map.len(),
-                        content_type = %content_type,
-                        "buffered + reverse-applied response from {url}",
+            .unwrap_or("")
+            .to_string();
+
+        if content_type.starts_with("text/event-stream") {
+            // Phase 2c: stream-process the SSE response. The
+            // SseReverser parses events as they arrive, accumulates
+            // `text_delta` payloads, holds back partial-placeholder
+            // tails across events, and emits reversed text
+            // downstream. Streaming UX preserved AND cross-event
+            // placeholder splits get reversed correctly.
+            tracing::info!(
+                placeholders = placeholder_map.len(),
+                content_type = %content_type,
+                "phase-2c streaming SSE reverse from {url}",
+            );
+            Body::from_stream(reverse_sse_stream(
+                upstream_resp.bytes_stream(),
+                placeholder_map,
+            ))
+        } else {
+            // Non-streaming path (application/json and anything else):
+            // buffer the full response, run reverse once, emit as a
+            // non-streaming Body. A non-streaming endpoint can't
+            // lose streaming it didn't have.
+            match upstream_resp.bytes().await {
+                Ok(bytes) => match std::str::from_utf8(&bytes) {
+                    Ok(s) => {
+                        let restored = proxy_core::reverse(s, &placeholder_map);
+                        tracing::info!(
+                            placeholders = placeholder_map.len(),
+                            content_type = %content_type,
+                            "buffered + reverse-applied response from {url}",
+                        );
+                        Body::from(Bytes::from(restored))
+                    }
+                    Err(_) => {
+                        tracing::debug!(
+                            "non-utf8 response from {url}, returning unchanged",
+                        );
+                        Body::from(bytes)
+                    }
+                },
+                Err(e) => {
+                    return error_response(
+                        StatusCode::BAD_GATEWAY,
+                        format!("upstream body: {e}"),
                     );
-                    Body::from(Bytes::from(restored))
                 }
-                Err(_) => {
-                    tracing::debug!(
-                        "non-utf8 response from {url}, returning unchanged",
-                    );
-                    Body::from(bytes)
-                }
-            },
-            Err(e) => {
-                return error_response(
-                    StatusCode::BAD_GATEWAY,
-                    format!("upstream body: {e}"),
-                );
             }
         }
     };
@@ -234,6 +247,90 @@ async fn forward(client: Client, url: String, req: Request) -> Response<Body> {
             format!("build relay response: {e}"),
         ),
     }
+}
+
+/// Wrap an upstream byte stream with an `SseReverser`, returning a
+/// new stream that emits reversed SSE bytes downstream.
+///
+/// The state machine has three resting states:
+///   - `Streaming`: pumping bytes from upstream through `push_bytes`
+///   - `Flushed`: upstream EOF reached; emit the final `flush_bytes`
+///     output (which carries any held-back text + the synthetic
+///     terminator events) and finish
+///   - terminated by returning `None` from the unfold
+///
+/// Errors from the upstream stream are forwarded as-is and end the
+/// stream (no more pushes after an error). `Body::from_stream` is
+/// happy with `Stream<Item = io::Result<Bytes>>`; we map reqwest's
+/// error into an `io::Error` for that boundary.
+fn reverse_sse_stream<S>(
+    upstream: S,
+    map: PlaceholderMap,
+) -> impl Stream<Item = std::io::Result<Bytes>> + Send
+where
+    S: Stream<Item = reqwest::Result<Bytes>> + Send + Unpin + 'static,
+{
+    // The size difference between Streaming and Flushed is fine: we
+    // allocate this enum once per upstream response and toggle between
+    // the two variants in-place. Boxing the inner struct would add a
+    // heap allocation per request without observable benefit.
+    #[allow(clippy::large_enum_variant)]
+    enum State<S> {
+        Streaming {
+            upstream: S,
+            reverser: SseReverser,
+            map: PlaceholderMap,
+        },
+        Flushed,
+    }
+
+    stream::unfold(
+        State::Streaming {
+            upstream,
+            reverser: SseReverser::new(),
+            map,
+        },
+        |state| async move {
+            let State::Streaming {
+                mut upstream,
+                mut reverser,
+                map,
+            } = state
+            else {
+                return None;
+            };
+
+            match upstream.next().await {
+                Some(Ok(bytes)) => {
+                    let out = reverser.push_bytes(&bytes, &map);
+                    Some((
+                        Ok(out),
+                        State::Streaming {
+                            upstream,
+                            reverser,
+                            map,
+                        },
+                    ))
+                }
+                Some(Err(e)) => {
+                    // Surface the upstream error as an io::Error so
+                    // Body::from_stream propagates it. We do NOT
+                    // attempt to flush — the half-processed state is
+                    // not safe to emit after a stream-level error.
+                    let io_err = std::io::Error::other(e);
+                    Some((Err(io_err), State::Flushed))
+                }
+                None => {
+                    // Clean upstream EOF: emit the final flush bytes
+                    // (held-back text + content_block_stop / message_stop
+                    // events already passed through), then terminate
+                    // on the next poll.
+                    let final_bytes = reverser.flush_bytes(&map);
+                    Some((Ok(final_bytes), State::Flushed))
+                }
+            }
+        },
+    )
 }
 
 fn error_response(status: StatusCode, msg: String) -> Response<Body> {

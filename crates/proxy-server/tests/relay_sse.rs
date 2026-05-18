@@ -192,6 +192,181 @@ async fn relay_streams_openai_chat_completions_chunks_over_time() -> Result<()> 
     Ok(())
 }
 
+/// Phase 2c contract: when the prompt contains a secret, the response
+/// STILL streams chunk-by-chunk to the client. The cross-event-split
+/// correctness test (`phase_2c_relay_reverses_placeholder_split_across_sse_events`
+/// in `relay_redacts.rs`) only proves the bytes come out right; this
+/// test proves they come out OVER TIME — i.e., Phase 2c didn't
+/// silently fall back to Phase 2b's whole-response buffering.
+///
+/// Without this, a regression that re-introduced buffering for the
+/// with-secrets case would still pass the correctness test (collected
+/// bytes reverse to the same final string), but the streaming-UX
+/// claim in the README would be a lie.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn phase_2c_relay_streams_chunks_over_time_with_secrets_present() -> Result<()> {
+    const GAP: Duration = Duration::from_millis(150);
+    // Three events with two 150ms gaps → ≥300ms upstream emission.
+    // Client must observe ≥200ms between first-byte and last-byte to
+    // be considered streaming.
+    const STREAMING_SPAN_THRESHOLD: Duration = Duration::from_millis(200);
+
+    let upstream = spawn_anthropic_sse_upstream_with_gap(
+        "/v1/messages",
+        vec![
+            // Event 1: bare text, no placeholder. Emits immediately.
+            r#"{"type":"content_block_delta","delta":{"type":"text_delta","text":"Hello "}}"#,
+            // Event 2: a complete placeholder. The SseReverser sees
+            // `«...»` inside one event's text_delta and reverses it.
+            r#"{"type":"content_block_delta","delta":{"type":"text_delta","text":"«SECRET_AWS_KEY_001»"}}"#,
+            // Event 3: more text. Confirms the stream continues
+            // past a reverse.
+            r#"{"type":"content_block_delta","delta":{"type":"text_delta","text":" works."}}"#,
+        ],
+        GAP,
+    )
+    .await?;
+
+    let config = RelayConfig {
+        anthropic_upstream: format!("http://{}", upstream.addr),
+        openai_upstream: "http://127.0.0.1:1".to_string(),
+    };
+    let (relay_addr, shutdown_tx) = spawn_relay(config).await?;
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()?;
+
+    // The prompt CONTAINS the AWS key, so the proxy mints a
+    // placeholder and routes the response through the SseReverser
+    // (the with-secrets path). Without the key in the prompt, the
+    // empty-map fast-path would short-circuit the streaming wrapper
+    // and this test would be trivially streaming (which is what the
+    // existing no-secrets test pins).
+    let resp = client
+        .post(format!("http://{relay_addr}/v1/messages"))
+        .header("x-api-key", "fake-test-key")
+        .json(&json!({
+            "model": "claude-opus-4-5",
+            "stream": true,
+            "messages": [{
+                "role": "user",
+                "content": "Debug AKIAIOSFODNN7EXAMPLE on S3.",
+            }],
+        }))
+        .send()
+        .await?;
+
+    assert_eq!(resp.status(), 200);
+
+    // Track non-empty chunk arrival times. Empty Bytes from
+    // SseReverser (partial-event buffering, partial-placeholder
+    // holdback) don't count as streaming progress.
+    let mut stream = resp.bytes_stream();
+    let start = Instant::now();
+    let mut first_at: Option<Duration> = None;
+    let mut last_at: Option<Duration> = None;
+    let mut buf = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        let t = start.elapsed();
+        if !chunk.is_empty() {
+            if first_at.is_none() {
+                first_at = Some(t);
+            }
+            last_at = Some(t);
+        }
+        buf.extend_from_slice(&chunk);
+    }
+
+    let first = first_at.expect("at least one non-empty chunk");
+    let last = last_at.expect("at least one non-empty chunk");
+    let span = last - first;
+
+    let text = std::str::from_utf8(&buf)?;
+    assert!(
+        text.contains("AKIAIOSFODNN7EXAMPLE"),
+        "Phase 2c must restore the secret; client sees:\n{text}",
+    );
+    assert!(
+        !text.contains("\u{ab}SECRET_"),
+        "placeholder leaked to client:\n{text}",
+    );
+
+    assert!(
+        span >= STREAMING_SPAN_THRESHOLD,
+        "expected streaming UX preserved with secrets present (\u{2265}{STREAMING_SPAN_THRESHOLD:?}); \
+         got span {span:?}. This means Phase 2c regressed to Phase 2b buffering."
+    );
+
+    let _ = shutdown_tx.send(());
+    Ok(())
+}
+
+/// Variant of `spawn_test_upstream_with_gap` that emits Anthropic-shaped
+/// SSE events (with `event: content_block_delta` headers and JSON
+/// `data:` payloads) on a configurable path. Used by the Phase 2c
+/// streaming test.
+async fn spawn_anthropic_sse_upstream_with_gap(
+    path: &'static str,
+    payloads: Vec<&'static str>,
+    gap: Duration,
+) -> Result<TestUpstream> {
+    let request_count = Arc::new(AtomicU64::new(0));
+
+    #[derive(Clone)]
+    struct State {
+        request_count: Arc<AtomicU64>,
+        payloads: Arc<Vec<&'static str>>,
+        gap: Duration,
+    }
+    let state = State {
+        request_count: request_count.clone(),
+        payloads: Arc::new(payloads),
+        gap,
+    };
+
+    async fn handler(
+        axum::extract::State(state): axum::extract::State<State>,
+        _body: axum::body::Bytes,
+    ) -> Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>> {
+        state.request_count.fetch_add(1, Ordering::Relaxed);
+        let payloads = state.payloads.clone();
+        let gap = state.gap;
+        let s = stream::unfold(0usize, move |idx| {
+            let payloads = payloads.clone();
+            async move {
+                if idx >= payloads.len() {
+                    return None;
+                }
+                if idx > 0 {
+                    tokio::time::sleep(gap).await;
+                }
+                let event = Event::default()
+                    .event("content_block_delta")
+                    .data(payloads[idx]);
+                Some((Ok::<_, Infallible>(event), idx + 1))
+            }
+        });
+        Sse::new(s)
+    }
+
+    let app = Router::new()
+        .route(path, post(handler))
+        .with_state(state);
+
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    Ok(TestUpstream {
+        addr,
+        request_count,
+    })
+}
+
 #[derive(Clone)]
 struct UpstreamState {
     request_count: Arc<AtomicU64>,

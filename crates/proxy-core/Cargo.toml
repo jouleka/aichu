@@ -14,3 +14,11 @@ path = "src/lib.rs"
 aho-corasick = { workspace = true }
 regex = { workspace = true }
 tracing = { workspace = true }
+# Phase 2c (sse module): parses content_block_delta JSON payloads and
+# re-serializes them with reversed text. The whole-event SSE parsing
+# is hand-rolled here; only the inner JSON round-trip needs serde.
+serde_json = { workspace = true }
+# Phase 2c (sse module): the byte-typed push/flush entry points
+# return `Bytes` so callers can pipe directly into a Body stream
+# without re-allocating.
+bytes = { workspace = true }

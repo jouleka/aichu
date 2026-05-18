@@ -7,14 +7,16 @@
 //     with typed placeholders before the body leaves this process
 //   - forward the redacted body upstream
 //
-// Response side (Phase 2):
+// Response side (Phase 2a + Phase 2c):
 //   - if the outbound pass minted no placeholders → response passes
 //     through unchanged (streaming preserved)
-//   - if the outbound pass DID mint placeholders → buffer the response,
-//     run `proxy_core::reverse`, emit non-streaming. Same trade-off
-//     documented in e02's Phase 2b: privacy wins over streaming UX for
-//     prompts that contain secrets; Phase 2c-style per-event SSE
-//     reversal is future work.
+//   - if the outbound pass DID mint placeholders AND the response is
+//     `text/event-stream` → stream-process via
+//     `proxy_core::SseReverser` (Phase 2c). Streaming UX preserved
+//     AND cross-event placeholder splits get reversed correctly.
+//   - otherwise (placeholders minted, non-streaming response) →
+//     buffer the response, run `proxy_core::reverse` once, emit
+//     non-streaming (Phase 2a).
 //
 // State threading: keyed by client_addr, not stored on the handler.
 //
@@ -64,7 +66,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use http_body_util::BodyExt;
+use futures_util::stream::{self, Stream, StreamExt};
+use http_body_util::{BodyDataStream, BodyExt};
 use hudsucker::{
     Body, HttpContext, HttpHandler, RequestOrResponse,
     hyper::{
@@ -72,7 +75,7 @@ use hudsucker::{
         header::{ACCEPT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE},
     },
 };
-use proxy_core::PlaceholderMap;
+use proxy_core::{PlaceholderMap, SseReverser};
 
 /// How long a placeholder-map entry may live before the opportunistic
 /// sweep evicts it. 15 minutes is comfortably longer than any
@@ -253,35 +256,58 @@ impl HttpHandler for AichuHandler {
 
         let (mut parts, body) = res.into_parts();
 
-        let body_bytes = match body.collect().await {
-            Ok(c) => c.to_bytes(),
-            Err(e) => {
-                tracing::warn!(error = %e, "failed to collect response body, returning empty");
-                return Response::from_parts(parts, Body::empty());
-            }
-        };
+        let new_body = if ct.starts_with("text/event-stream") {
+            // Phase 2c: stream-process the SSE response. The
+            // SseReverser parses events as they arrive, holds back
+            // partial-placeholder tails across events, and emits
+            // reversed text downstream event-by-event. Streaming UX
+            // preserved AND cross-event placeholder splits get
+            // reversed correctly. See
+            // `crates/proxy-server/tests/relay_redacts.rs::phase_2c_*`
+            // for the spec test.
+            tracing::info!(
+                placeholders = map.len(),
+                content_type = %ct,
+                "phase-2c streaming SSE reverse",
+            );
+            Body::from_stream(reverse_sse_stream(BodyDataStream::new(body), map))
+        } else {
+            // Phase 2a: non-streaming path. Buffer the response, run
+            // reverse once, emit as a non-streaming Body. A
+            // non-streaming endpoint can't lose streaming UX it didn't
+            // have. Same UTF-8 round-trip and "JSON delimiters don't
+            // appear inside placeholders" invariant we relied on for
+            // the outbound redaction.
+            let body_bytes = match body.collect().await {
+                Ok(c) => c.to_bytes(),
+                Err(e) => {
+                    tracing::warn!(error = %e, "failed to collect response body, returning empty");
+                    return Response::from_parts(parts, Body::empty());
+                }
+            };
 
-        let new_body = match std::str::from_utf8(&body_bytes) {
-            Ok(s) => {
-                let restored = proxy_core::reverse(s, &map);
-                tracing::info!(
-                    placeholders = map.len(),
-                    content_type = %ct,
-                    "buffered + reverse-applied response",
-                );
-                Body::from(Bytes::from(restored))
-            }
-            Err(_) => {
-                // Surface at warn level: this is almost always a sign
-                // the response is compressed (gzip / br / zstd) and
-                // we forgot to strip Accept-Encoding on the request
-                // side. Reverse pass cannot run on compressed bytes,
-                // so the user will see placeholders.
-                tracing::warn!(
-                    "response body is not valid UTF-8 (likely compressed); \
-                     reverse pass skipped, placeholders may reach client",
-                );
-                Body::from(body_bytes)
+            match std::str::from_utf8(&body_bytes) {
+                Ok(s) => {
+                    let restored = proxy_core::reverse(s, &map);
+                    tracing::info!(
+                        placeholders = map.len(),
+                        content_type = %ct,
+                        "buffered + reverse-applied response",
+                    );
+                    Body::from(Bytes::from(restored))
+                }
+                Err(_) => {
+                    // Surface at warn level: this is almost always a sign
+                    // the response is compressed (gzip / br / zstd) and
+                    // we forgot to strip Accept-Encoding on the request
+                    // side. Reverse pass cannot run on compressed bytes,
+                    // so the user will see placeholders.
+                    tracing::warn!(
+                        "response body is not valid UTF-8 (likely compressed); \
+                         reverse pass skipped, placeholders may reach client",
+                    );
+                    Body::from(body_bytes)
+                }
             }
         };
 
@@ -292,6 +318,79 @@ impl HttpHandler for AichuHandler {
 
         Response::from_parts(parts, new_body)
     }
+}
+
+/// Wrap a byte-frame stream from the upstream response body with an
+/// `SseReverser`, returning a new stream that emits reversed SSE
+/// bytes downstream. Mirrors `proxy_server::handler::reverse_sse_stream`
+/// — the two implementations differ only in their error type
+/// (hudsucker::Error vs io::Error) because the upstream Body types
+/// differ (hudsucker::Body via http_body_util vs reqwest::Response).
+fn reverse_sse_stream<S, E>(
+    upstream: S,
+    map: PlaceholderMap,
+) -> impl Stream<Item = Result<Bytes, hudsucker::Error>> + Send
+where
+    S: Stream<Item = Result<Bytes, E>> + Send + Unpin + 'static,
+    E: Into<hudsucker::Error> + Send + 'static,
+{
+    // The size difference between Streaming and Flushed is fine: we
+    // allocate this enum once per upstream response and toggle between
+    // the two variants in-place. Boxing the inner struct would add a
+    // heap allocation per request without observable benefit.
+    #[allow(clippy::large_enum_variant)]
+    enum State<S> {
+        Streaming {
+            upstream: S,
+            reverser: SseReverser,
+            map: PlaceholderMap,
+        },
+        Flushed,
+    }
+
+    stream::unfold(
+        State::Streaming {
+            upstream,
+            reverser: SseReverser::new(),
+            map,
+        },
+        |state| async move {
+            let State::Streaming {
+                mut upstream,
+                mut reverser,
+                map,
+            } = state
+            else {
+                return None;
+            };
+
+            match upstream.next().await {
+                Some(Ok(bytes)) => {
+                    let out = reverser.push_bytes(&bytes, &map);
+                    Some((
+                        Ok(out),
+                        State::Streaming {
+                            upstream,
+                            reverser,
+                            map,
+                        },
+                    ))
+                }
+                Some(Err(e)) => {
+                    // Propagate the upstream error. We do NOT flush —
+                    // the partially-processed state is not safe to
+                    // emit after a stream-level error.
+                    Some((Err(e.into()), State::Flushed))
+                }
+                None => {
+                    // Clean upstream EOF: emit the final flush bytes
+                    // and terminate on the next poll.
+                    let final_bytes = reverser.flush_bytes(&map);
+                    Some((Ok(final_bytes), State::Flushed))
+                }
+            }
+        },
+    )
 }
 
 /// Remove entries whose insertion time is older than `now - ttl`.

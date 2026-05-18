@@ -267,6 +267,137 @@ async fn mitm_reverses_placeholder_in_non_streaming_response() -> Result<()> {
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mitm_phase_2c_reverses_placeholder_split_across_sse_events() -> Result<()> {
+    // Parity with `proxy-server`'s phase_2c_relay_reverses_placeholder_split_across_sse_events.
+    // The placeholder is fragmented across two content_block_delta
+    // events (`«SECRET_AWS_` + `KEY_001»`). Phase 2b's whole-response
+    // reverse() couldn't bridge the JSON/SSE framing bytes between
+    // the two halves; Phase 2c's streaming SseReverser must.
+    //
+    // This test pins Mode B parity with Mode A on the headline
+    // Phase 2c contract — if a future refactor leaves the streaming
+    // path wired in proxy-server but missing in proxy-mitm, the
+    // privacy guarantee (and the streaming UX claim) would silently
+    // diverge between modes.
+    let upstream = spawn_upstream_returning_sse_with_split_placeholder("/v1/messages").await?;
+
+    let ca_dir = TempDir::new()?;
+    let ca = load_or_create_ca(ca_dir.path())?;
+    let handler = AichuHandler::new();
+    let (proxy_addr, shutdown_tx) = spawn_proxy(ca.authority, handler).await?;
+
+    let client = reqwest::Client::builder()
+        .proxy(reqwest::Proxy::http(format!("http://{proxy_addr}"))?)
+        .timeout(Duration::from_secs(5))
+        .build()?;
+
+    let resp = client
+        .post(format!("http://{}/v1/messages", upstream.addr))
+        .header("x-api-key", "fake-test-key")
+        .json(&json!({
+            "model": "claude-opus-4-5",
+            "stream": true,
+            "max_tokens": 100,
+            "messages": [{
+                "role": "user",
+                "content": "Debug AKIAIOSFODNN7EXAMPLE on S3.",
+            }],
+        }))
+        .send()
+        .await?;
+
+    assert_eq!(resp.status(), 200);
+    let body = resp.text().await?;
+    assert!(
+        body.contains("AKIAIOSFODNN7EXAMPLE"),
+        "secret not restored across split SSE events; client sees:\n{body}"
+    );
+    assert!(
+        !body.contains("\u{ab}SECRET_"),
+        "placeholder leaked to client (Phase 2c reverse failed):\n{body}"
+    );
+    assert!(body.contains("needs s3:GetObject"));
+
+    let _ = shutdown_tx.send(());
+    Ok(())
+}
+
+async fn spawn_upstream_returning_sse_with_split_placeholder(
+    path: &'static str,
+) -> Result<CapturingUpstream> {
+    // Fixture mirrors `proxy-server/tests/relay_redacts.rs::spawn_upstream_returning_sse_with_split_placeholder`.
+    // Event 1's text ends with `«SECRET_AWS_`, event 2's text begins
+    // with `KEY_001»`. The whole-buffer reverse regex can't match
+    // across the intervening `"}}\n\nevent: ...,"text":"` bytes.
+    spawn_sse_upstream(
+        path,
+        vec![
+            r#"{"type":"content_block_delta","delta":{"type":"text_delta","text":"Your «SECRET_AWS_"}}"#
+                .to_string(),
+            r#"{"type":"content_block_delta","delta":{"type":"text_delta","text":"KEY_001» needs s3:GetObject."}}"#
+                .to_string(),
+        ],
+    )
+    .await
+}
+
+async fn spawn_sse_upstream(
+    path: &'static str,
+    events: Vec<String>,
+) -> Result<CapturingUpstream> {
+    use axum::response::sse::{Event as SseEvent, Sse};
+    use futures_util::stream;
+    use std::convert::Infallible;
+
+    let request_count = Arc::new(AtomicU64::new(0));
+    let last_body = Arc::new(std::sync::Mutex::new(None));
+
+    #[derive(Clone)]
+    struct SseState {
+        request_count: Arc<AtomicU64>,
+        last_body: Arc<std::sync::Mutex<Option<Bytes>>>,
+        events: Arc<Vec<String>>,
+    }
+    let state = SseState {
+        request_count: request_count.clone(),
+        last_body: last_body.clone(),
+        events: Arc::new(events),
+    };
+
+    let handler = move |State(state): State<SseState>,
+                        body: Bytes|
+          -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Sse<_>> + Send>,
+    > {
+        state.request_count.fetch_add(1, Ordering::Relaxed);
+        *state.last_body.lock().unwrap() = Some(body);
+
+        let events: Vec<Result<SseEvent, Infallible>> = state
+            .events
+            .iter()
+            .map(|data| {
+                Ok(SseEvent::default().event("content_block_delta").data(data))
+            })
+            .collect();
+        Box::pin(async move { Sse::new(stream::iter(events)) })
+    };
+
+    let app = Router::new().route(path, post(handler)).with_state(state);
+
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    Ok(CapturingUpstream {
+        addr,
+        request_count,
+        last_body,
+    })
+}
+
 // --- mock upstream scaffolding ---
 
 #[derive(Clone)]

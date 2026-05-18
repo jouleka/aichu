@@ -208,13 +208,6 @@ suspect exposure.
 
 ### Known limitations (v0)
 
-- **Cross-event placeholder splits in streaming SSE.** When the model
-  splits a placeholder across two `content_block_delta` events, the
-  buffered-byte reverse pass can't match the placeholder across the
-  intervening SSE/JSON framing. The placeholder leaks to the user.
-  Phase 2c (per-event SSE-aware reversal) fixes this and is encoded
-  as an `#[ignore]`d executable spec in
-  `crates/proxy-server/tests/relay_redacts.rs`.
 - **HTTP/2 multiplexing.** Mode B keys the per-request PlaceholderMap
   by `client_addr`. HTTP/2 multiplexed streams share a TCP connection
   (and thus a `client_addr`), so two truly concurrent requests on one
@@ -231,10 +224,6 @@ suspect exposure.
   zero; under sustained pathological churn it could reach the low
   thousands transiently before the next sweep — single-digit MB at
   most.
-- **No streaming UX when secrets are present** (Mode B + most of Mode
-  A SSE). When the prompt contains a secret, the proxy buffers the
-  whole upstream response before reversing — streaming-UX cost
-  documented as Phase 2b → Phase 2c migration path.
 - **Pattern coverage growing.** The 9 v0 patterns cover the most
   common secret shapes that appear in pasted `.env` files and code
   snippets, but the universe of secrets is broader — custom HMAC

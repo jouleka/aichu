@@ -278,24 +278,21 @@ async fn relay_reverses_placeholder_in_streaming_sse_response() -> Result<()> {
     Ok(())
 }
 
-/// Phase 2c spec, encoded as an ignored test.
+/// Phase 2c contract: when a placeholder is fragmented across two
+/// `content_block_delta` events (e.g. event 1 ends with `«SECRET_AWS_`
+/// and event 2 begins with `KEY_001»`), the streaming SSE reverser
+/// must accumulate `text_delta` payloads across events and substitute
+/// the original secret back before it reaches the client.
 ///
-/// When a placeholder is fragmented across two `content_block_delta`
-/// events (e.g. event 1 ends with `«SECRET_AWS_` and event 2 begins
-/// with `KEY_001»`), the whole-response buffer contains the placeholder
-/// with JSON/SSE framing bytes (`"}}\n\nevent: content_block_delta\n
-/// data: {"...,"text":"`) inserted between the two halves. proxy_core's
-/// reverse regex `«SECRET_[A-Z0-9_]+_[0-9]+»` cannot match across those
-/// framing bytes — `"` / `}` / whitespace aren't in the character class
-/// — so the placeholder stays in the response and the user sees the
-/// fragments.
-///
-/// Phase 2c will land per-event SSE parsing that buffers `text_delta`
-/// payloads at the JSON level, eliminating this gap. This test
-/// encodes the desired future behavior; it currently fails and is
-/// marked `#[ignore]` until Phase 2c.
+/// Phase 2b's whole-response buffering couldn't match across the
+/// intervening JSON/SSE framing bytes (`"}}\n\nevent: ...,
+/// "text":"`); proxy_core::reverse's `«SECRET_[A-Z0-9_]+_[0-9]+»`
+/// regex character class rejected the punctuation in between. Phase
+/// 2c moves the reversal up the stack to per-event JSON
+/// re-serialization (see `proxy_core::sse::SseReverser`), so the
+/// placeholder is recognized even when its bytes arrive in separate
+/// events.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "Phase 2c: per-event SSE reversal handles placeholders split across content_block_delta events"]
 async fn phase_2c_relay_reverses_placeholder_split_across_sse_events() -> Result<()> {
     let upstream =
         spawn_upstream_returning_sse_with_split_placeholder("/v1/messages").await?;
@@ -429,13 +426,11 @@ async fn fixed_response_handler(
 /// Mock upstream that returns an SSE stream with three
 /// `content_block_delta` events. The placeholder sits WHOLLY inside
 /// event 2's `text_delta.text` field; events 1 and 3 carry the
-/// surrounding prose ("Your " and " needs s3:GetObject."). This
-/// exercises the buffer-then-reverse path concatenating multiple
-/// events, but NOT the cross-event-split case where the placeholder
-/// itself spans multiple events — that's a known Phase 2b limitation
-/// (intermediate JSON/SSE framing breaks the placeholder regex) and
-/// is captured by `phase_2c_relay_reverses_placeholder_split_across_sse_events`
-/// (currently `#[ignore]`d).
+/// surrounding prose ("Your " and " needs s3:GetObject."). The
+/// cross-event-split case (placeholder fragments span events) is
+/// the harder failure mode and is captured by
+/// `phase_2c_relay_reverses_placeholder_split_across_sse_events`
+/// (uses `spawn_upstream_returning_sse_with_split_placeholder`).
 async fn spawn_upstream_returning_sse_with_placeholder(
     path: &'static str,
 ) -> Result<CapturingUpstream> {

@@ -1623,7 +1623,9 @@ name = "proxy-core"
 version = "0.1.0"
 dependencies = [
  "aho-corasick",
+ "bytes",
  "regex",
+ "serde_json",
  "tracing",
 ]
 
