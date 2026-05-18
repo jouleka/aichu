@@ -128,10 +128,12 @@ not adversarial.
   to your filesystem; if it wants your `.env`, it can `cat` it directly
   rather than embed it in a prompt. aichu sits in the network path, not the
   filesystem path.
-- **Secrets in formats we don't detect.** v0 covers 7 prefix-typed
-  patterns (Anthropic, OpenAI, AWS access key, GitHub PAT, Stripe live,
-  JWT, Slack token). AWS secret keys, PEM blocks, custom tokens with no
-  distinctive prefix are NOT redacted today. See "Known limitations" below.
+- **Secrets in formats we don't detect.** v0 covers 9 patterns:
+  Anthropic, OpenAI, AWS access key, GitHub PAT, Stripe live key, JWT,
+  Slack token, AWS secret access key (identifier-anchored + entropy
+  gate), PEM private-key blocks (multi-line, RSA/EC/PKCS#8/OpenSSH/DSA).
+  Custom tokens with no distinctive prefix and no surrounding identifier
+  are NOT redacted. See "Known limitations" below.
 - **Model paraphrase / drop of placeholders.** When the model preserves
   `«SECRET_AWS_KEY_001»` verbatim in its response, we reverse it back to
   the original secret. When the model paraphrases ("your AWS key"), there
@@ -226,9 +228,14 @@ suspect exposure.
   A SSE). When the prompt contains a secret, the proxy buffers the
   whole upstream response before reversing — streaming-UX cost
   documented as Phase 2b → Phase 2c migration path.
-- **Pattern coverage incomplete.** AWS_SECRET (no distinctive prefix;
-  needs entropy gate + identifier-proximity) and PEM blocks (need
-  multi-line scanning) are deferred.
+- **Pattern coverage growing.** The 9 v0 patterns cover the most
+  common secret shapes that appear in pasted `.env` files and code
+  snippets, but the universe of secrets is broader — custom HMAC
+  signatures, GCP service-account JSONs, Twilio auth tokens,
+  Cloudflare API tokens, etc. are not yet covered. The architecture
+  scales (one new variant + regex + dedicated detection tests per
+  pattern); coverage expansion is a future-work axis, not a v0
+  ship-blocker.
 - **Manual eval not yet run.** The e03 harness can measure placeholder
   preservation rates across model families. The real-API run is gated
   on Anthropic Console credits and remains a deferred work item.

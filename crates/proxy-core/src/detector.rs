@@ -424,4 +424,104 @@ mod tests {
         assert_eq!(f[0].text, "AKIAIOSFODNN7EXAMPLE");
         assert_eq!(f[1].text, "AKIAIOSFODNN7EXAMPLE");
     }
+
+    // ---- PEM private-key block detection -----------------------------------
+
+    #[test]
+    fn detects_rsa_private_key_pem_block() {
+        // RSA PKCS#1 format — the most common SSH/TLS key shape. The
+        // whole multi-line block (header + base64 body + footer) is the
+        // matched secret.
+        let pem = "\
+-----BEGIN RSA PRIVATE KEY-----
+MIIEpAIBAAKCAQEAxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy
+-----END RSA PRIVATE KEY-----";
+        let prompt = format!("Here is my key:\n{pem}\nPlease deploy.");
+        let f = scan(&prompt);
+        assert_eq!(kinds(&f), vec![SecretKind::PemPrivateKey]);
+        assert_eq!(f[0].text, pem, "the whole PEM block should be the secret");
+    }
+
+    #[test]
+    fn detects_generic_pkcs8_private_key_pem_block() {
+        // No type qualifier — `BEGIN PRIVATE KEY` (PKCS#8 generic) is
+        // what most modern tooling emits. The regex's optional
+        // `(?:[A-Z][A-Z0-9 ]*? )?` clause covers this.
+        let pem = "\
+-----BEGIN PRIVATE KEY-----
+MIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQDxxxxxxxxxxxxxx
+-----END PRIVATE KEY-----";
+        let f = scan(pem);
+        assert_eq!(kinds(&f), vec![SecretKind::PemPrivateKey]);
+    }
+
+    #[test]
+    fn detects_openssh_private_key_pem_block() {
+        // OpenSSH's custom envelope format — `ssh-keygen` default since
+        // OpenSSH 7.8. Common enough to need its own coverage check.
+        let pem = "\
+-----BEGIN OPENSSH PRIVATE KEY-----
+b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABxxxxxxxxxxxxx
+-----END OPENSSH PRIVATE KEY-----";
+        let f = scan(pem);
+        assert_eq!(kinds(&f), vec![SecretKind::PemPrivateKey]);
+    }
+
+    #[test]
+    fn does_not_flag_certificate_pem_block() {
+        // Certificates are public; flagging them as secrets would be a
+        // privacy false-positive that adds friction without privacy
+        // benefit. The regex's `PRIVATE KEY` suffix is the
+        // discriminator.
+        //
+        // Asserting `f.is_empty()` (not just "no PEM finding") guards
+        // against a future fixture swap where a longer realistic
+        // base64 body happens to contain e.g. `AKIA[0-9A-Z]{16}` and
+        // trips `AwsAccessKey` silently — the test would still pass
+        // the loose check but the real expectation is "this block is
+        // not a secret of any kind."
+        let pem = "\
+-----BEGIN CERTIFICATE-----
+MIIDazCCAlOgAwIBAgIUWAxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+-----END CERTIFICATE-----";
+        let f = scan(pem);
+        assert!(f.is_empty(), "CERTIFICATE block must produce no findings: {f:?}");
+    }
+
+    #[test]
+    fn does_not_flag_public_key_pem_block() {
+        // Same rationale as certificates — public keys are designed to
+        // be shared. Tight assertion matches the CERTIFICATE test's.
+        let pem = "\
+-----BEGIN PUBLIC KEY-----
+MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAxxxxxxxxxxxxxxxxxxxx
+-----END PUBLIC KEY-----";
+        let f = scan(pem);
+        assert!(f.is_empty(), "PUBLIC KEY block must produce no findings: {f:?}");
+    }
+
+    #[test]
+    fn two_pem_keys_in_one_input_yield_two_findings() {
+        // The detector returns one Finding per non-overlapping match;
+        // PlaceholderMap's dedup is a separate concern. Two distinct
+        // keys (different bodies) → two findings.
+        let input = "\
+First key:
+-----BEGIN RSA PRIVATE KEY-----
+AAAAA
+-----END RSA PRIVATE KEY-----
+Second key (different body):
+-----BEGIN EC PRIVATE KEY-----
+BBBBB
+-----END EC PRIVATE KEY-----";
+        let f = scan(input);
+        let pem_findings: Vec<_> = f
+            .iter()
+            .filter(|x| x.kind == SecretKind::PemPrivateKey)
+            .collect();
+        assert_eq!(pem_findings.len(), 2, "expected two PEM findings, got {f:?}");
+        assert!(pem_findings[0].text.contains("AAAAA"));
+        assert!(pem_findings[1].text.contains("BBBBB"));
+    }
 }

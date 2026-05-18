@@ -1,15 +1,11 @@
 // Secret-pattern rules.
 //
-// We ship PREFIX-TYPED patterns from build-plan §3. These are
-// unambiguous (Anthropic, OpenAI, AWS access key, GitHub PAT, Stripe
-// live key, JWT, Slack token) — patterns where the FALSE-POSITIVE rate
-// on real text is low because the prefix is distinctive and the rest
-// of the pattern is shape-constrained.
-//
-// Still deferred: AWS_SECRET (no distinctive prefix; needs entropy
-// gate + identifier-proximity check to avoid false positives on bare
-// 40-char base64-ish strings) and PEM blocks (multi-line, requires
-// scanning across newlines).
+// We ship PREFIX-TYPED patterns from build-plan §3 (Anthropic, OpenAI,
+// AWS access key, GitHub PAT, Stripe live key, JWT, Slack token) —
+// distinctive prefixes + shape-constrained tails make the FALSE-POSITIVE
+// rate on real text low. Plus two structural patterns: AWS_SECRET
+// (identifier-anchored + entropy gate) and PEM private-key blocks
+// (multi-line, BEGIN/END framed).
 
 use std::fmt;
 
@@ -36,6 +32,14 @@ pub enum SecretKind {
     /// Shannon entropy below ~3.5, so an all-zeros or repeating
     /// pattern after the identifier is also rejected.
     AwsSecretAccessKey,
+    /// PEM-encoded private keys, framed by `BEGIN ... PRIVATE KEY` and
+    /// `END ... PRIVATE KEY` markers (PKCS#1 `RSA`, SEC1 `EC`, PKCS#8
+    /// generic + encrypted, OpenSSH, DSA). The whole multi-line block
+    /// is the secret — header, base64 body, and footer all redact.
+    ///
+    /// Public keys, certificates, and certificate requests are NOT
+    /// matched — only blocks whose label ends in `PRIVATE KEY`.
+    PemPrivateKey,
 }
 
 impl SecretKind {
@@ -51,6 +55,7 @@ impl SecretKind {
         SecretKind::Jwt,
         SecretKind::SlackToken,
         SecretKind::AwsSecretAccessKey,
+        SecretKind::PemPrivateKey,
     ];
 
     /// Keywords the aho-corasick pre-filter scans for. If `input` does
@@ -83,6 +88,9 @@ impl SecretKind {
             SecretKind::AwsSecretAccessKey => {
                 &["aws_secret_access_key", "AWS_SECRET_ACCESS_KEY"]
             }
+            // PEM blocks always start with this exact 11-byte sequence;
+            // the regex then narrows to PRIVATE KEY labels only.
+            SecretKind::PemPrivateKey => &["-----BEGIN"],
         }
     }
 
@@ -138,6 +146,26 @@ impl SecretKind {
             // a larger one.
             SecretKind::AwsSecretAccessKey => {
                 r#"(?i)\baws_secret_access_key[\s"':=]+([A-Za-z0-9/+=]{40})"#
+            }
+            // PEM private-key block, multi-line. `(?s)` enables dotall
+            // so `.` matches `\n` across the base64 body. The optional
+            // `(?:[A-Z][A-Z0-9 ]*? )?` qualifier covers `BEGIN PRIVATE
+            // KEY` (generic PKCS#8), `BEGIN RSA PRIVATE KEY`, `BEGIN
+            // EC PRIVATE KEY`, `BEGIN OPENSSH PRIVATE KEY`, `BEGIN
+            // ENCRYPTED PRIVATE KEY`, `BEGIN DSA PRIVATE KEY`. The
+            // mandatory `PRIVATE KEY` suffix is the discriminator that
+            // excludes certificates, public keys, and CSRs (whose
+            // labels are `CERTIFICATE`, `PUBLIC KEY`, `CERTIFICATE
+            // REQUEST`).
+            //
+            // No backreference: the `regex` crate doesn't support `\1`,
+            // so a malformed input with `BEGIN RSA ... END EC` would
+            // false-positive. Real-world cost: negligible (no tool
+            // emits malformed PEM); detection cost of skipping a real
+            // key with type-mismatched markers: catastrophic. We
+            // prefer the false-positive risk.
+            SecretKind::PemPrivateKey => {
+                r"(?s)-----BEGIN (?:[A-Z][A-Z0-9 ]*? )?PRIVATE KEY-----.*?-----END (?:[A-Z][A-Z0-9 ]*? )?PRIVATE KEY-----"
             }
         }
     }
@@ -197,6 +225,7 @@ impl SecretKind {
             SecretKind::Jwt => "JWT",
             SecretKind::SlackToken => "SLACK_TOKEN",
             SecretKind::AwsSecretAccessKey => "AWS_SECRET",
+            SecretKind::PemPrivateKey => "PEM_KEY",
         }
     }
 }
@@ -281,6 +310,16 @@ mod tests {
                 &[
                     format!("AWS_SECRET_ACCESS_KEY={}", "a".repeat(40)),
                     format!("aws_secret_access_key=\"{}\"", "b".repeat(40)),
+                ],
+            ),
+            (
+                SecretKind::PemPrivateKey,
+                &[
+                    // Minimal valid-shaped blocks for each labeled variant
+                    // we want the regex to handle.
+                    "-----BEGIN RSA PRIVATE KEY-----\nMIIE\n-----END RSA PRIVATE KEY-----".to_string(),
+                    "-----BEGIN PRIVATE KEY-----\nMIIE\n-----END PRIVATE KEY-----".to_string(),
+                    "-----BEGIN OPENSSH PRIVATE KEY-----\nb3Bl\n-----END OPENSSH PRIVATE KEY-----".to_string(),
                 ],
             ),
         ];
