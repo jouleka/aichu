@@ -693,7 +693,7 @@ fn check_proxy_port_listening(addr: SocketAddr) -> CheckResult {
 /// Pure file-existence check, no subprocess. Compiles on every target
 /// so the unit test runs cross-OS.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-fn check_linux_debian_trust_source(cert_dest: &Path) -> CheckResult {
+fn check_linux_anchor_file_present(cert_dest: &Path) -> CheckResult {
     if cert_dest.exists() {
         CheckResult::Ok(format!("CA present at {}", cert_dest.display()))
     } else {
@@ -719,7 +719,7 @@ fn linux_doctor_trust_source_check() -> (&'static str, CheckResult) {
     if is_debian_family(|p| Path::new(p).exists()) {
         return (
             "CA in trust source (Debian-family)",
-            check_linux_debian_trust_source(Path::new(LINUX_DEBIAN_CERT_DEST)),
+            check_linux_anchor_file_present(Path::new(LINUX_DEBIAN_CERT_DEST)),
         );
     }
     let family = read_os_release()
@@ -728,11 +728,11 @@ fn linux_doctor_trust_source_check() -> (&'static str, CheckResult) {
     match family {
         Some(LinuxFamily::RedHat) => (
             "CA in trust source (Red Hat-family)",
-            check_linux_debian_trust_source(Path::new(LINUX_REDHAT_CERT_DEST)),
+            check_linux_anchor_file_present(Path::new(LINUX_REDHAT_CERT_DEST)),
         ),
         Some(LinuxFamily::Arch) => (
             "CA in trust source (Arch-family)",
-            check_linux_debian_trust_source(Path::new(LINUX_ARCH_CERT_DEST)),
+            check_linux_anchor_file_present(Path::new(LINUX_ARCH_CERT_DEST)),
         ),
         None => ("CA in trust source", linux_doctor_unknown_family_result()),
     }
@@ -1167,7 +1167,7 @@ mod tests {
     }
 
     #[test]
-    fn check_linux_debian_trust_source_ok_when_cert_present() {
+    fn check_linux_anchor_file_present_ok_when_cert_present() {
         // File existence at the destination path is the signal that
         // `aichu trust` ran successfully — `update-ca-certificates`
         // would have folded the cert into the bundle on its last run.
@@ -1175,18 +1175,18 @@ mod tests {
         let dest = dir.path().join("aichu-ca.crt");
         std::fs::write(&dest, "fake-cert-bytes").unwrap();
         assert!(matches!(
-            check_linux_debian_trust_source(&dest),
+            check_linux_anchor_file_present(&dest),
             CheckResult::Ok(_)
         ));
     }
 
     #[test]
-    fn check_linux_debian_trust_source_fails_when_cert_absent() {
+    fn check_linux_anchor_file_present_fails_when_cert_absent() {
         // Absence means `aichu trust` hasn't run (or `aichu untrust`
         // removed it). The hint must point at `aichu trust`.
         let dir = tempfile::TempDir::new().unwrap();
         let dest = dir.path().join("aichu-ca.crt"); // intentionally not created
-        match check_linux_debian_trust_source(&dest) {
+        match check_linux_anchor_file_present(&dest) {
             CheckResult::Fail { hint, .. } => {
                 assert!(
                     hint.contains("aichu trust"),
