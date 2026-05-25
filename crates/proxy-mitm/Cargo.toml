@@ -31,3 +31,10 @@ tempfile = { workspace = true }
 futures-util = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time", "net"] }
+# h2 + http are used by the HTTP/2 multiplex race regression test, which
+# drives the proxy over raw TCP with two concurrent streams sharing one
+# `client_addr`. We can't reproduce the race with reqwest because its
+# HTTP/1.1 pool refuses to pipeline; the deterministic repro needs an
+# HTTP/2 client we can fully control on a single connection.
+h2 = "0.4"
+http = "1"

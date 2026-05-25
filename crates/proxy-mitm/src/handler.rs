@@ -18,52 +18,35 @@
 //     buffer the response, run `proxy_core::reverse` once, emit
 //     non-streaming (Phase 2a).
 //
-// State threading: keyed by client_addr, not stored on the handler.
+// State threading: per-request, on the handler instance itself.
 //
-// Hudsucker's published trait docs say "each request/response pair is
-// passed to the same instance." Empirically (live smoke test against
-// real claude CLI through MITM), this is NOT true under HTTPS CONNECT
-// MITM: hudsucker spawns separate handler clones for handle_request
-// vs handle_response, and a per-clone field like `current_map` is
-// empty when handle_response sees it. State must therefore live in
-// shared storage that survives the clone boundary.
+// Hudsucker's outer dispatcher clones the handler exactly once per
+// request before invoking `handle_request`, and the same clone is
+// later given to `handle_response` for that same request — see
+// `hudsucker::proxy::internal::InternalProxy::proxy`, which threads
+// `&mut self.http_handler` through both calls inside one async task.
+// HTTP/2 multiplexing therefore produces N concurrent CLONES of this
+// handler on a single TLS connection (one per in-flight stream),
+// each with its own `current_map`. There is no shared map slot to
+// collide on, so two overlapping HTTP/2 streams cannot leak each
+// other's secrets — pinned by
+// `mitm_isolates_concurrent_h2_streams_on_one_connection`.
 //
-// We use `Arc<Mutex<HashMap<SocketAddr, PlaceholderMap>>>` keyed by
-// `HttpContext.client_addr`. The same address is observed in both
-// handle_request and handle_response for a given request, so the
-// response side can look up what the request side recorded.
+// History: an earlier revision stored maps in
+// `Arc<Mutex<HashMap<SocketAddr, ...>>>` keyed by
+// `HttpContext.client_addr`. That was a real privacy bug under H2
+// multiplexing because every stream on one connection shares one
+// `client_addr` and would race on the same key. Per-clone state
+// removes both the race AND the orphan-entry leak that motivated
+// the previous TTL sweep (a dropped clone naturally drops its
+// `current_map`).
 //
-// Known limitation (v0): HTTP/2 multiplexing — one client_addr can
-// carry several concurrent requests on a single TLS stream. Two
-// overlapping requests would race on the same map slot. v0 ships
-// this as an accepted limitation; a follow-up can key on something
-// finer-grained (e.g., a stream id) when we have an integration test
-// that catches a collision.
-//
-// Orphaned-entry cleanup: entries are tagged with an `Instant` on
-// insert, and every prompt-endpoint request opportunistically sweeps
-// the map for anything older than `ENTRY_TTL` (15 minutes). This
-// bounds the memory footprint when `handle_response` never runs (TLS
-// error after request forwarded, client cancellation, upstream
-// timeout). No background task — the sweep runs on the request path
-// so there's no extra synchronization beyond the existing Mutex.
-//
-// What the TTL actually needs to cover: the gap between a request
-// being forwarded and `handle_response` firing for its INITIAL
-// HEADERS, not the full streaming duration. Healthy upstreams
-// (Anthropic, OpenAI, OpenCode) send response headers within seconds
-// even for long streaming generations; the body can take minutes
-// without keeping the map entry alive (the entry is removed the
-// moment `handle_response` runs). 15 minutes is a generous margin
-// over that seconds-scale reality — raising it for "Anthropic
-// streams can run 10 minutes" would be a misread.
+// `request_count` remains `Arc<AtomicU64>` because it is intentionally
+// shared across every clone — integration tests assert on the total
+// request count across the whole proxy.
 
-use std::collections::HashMap;
-use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use futures_util::stream::{self, Stream, StreamExt};
@@ -77,26 +60,17 @@ use hudsucker::{
 };
 use proxy_core::{PlaceholderMap, SseReverser};
 
-/// How long a placeholder-map entry may live before the opportunistic
-/// sweep evicts it. 15 minutes is comfortably longer than any
-/// legitimate request→initial-response gap (Anthropic and OpenAI send
-/// response headers within seconds, even for long streaming
-/// generations) while still bounding orphaned-entry memory.
-const ENTRY_TTL: Duration = Duration::from_secs(15 * 60);
-
 #[derive(Clone, Default)]
 pub struct AichuHandler {
     request_count: Arc<AtomicU64>,
-    /// Per-request PlaceholderMaps keyed by `HttpContext.client_addr`,
-    /// each tagged with its insertion `Instant`. Populated in
-    /// `handle_request` (if anything was redacted) and consumed
-    /// (removed) in `handle_response`. The timestamp drives the
-    /// opportunistic TTL sweep — see `sweep_stale` and the
-    /// module-level cleanup note above.
-    ///
-    /// `Arc<Mutex<...>>` so the state survives the handler clones
-    /// hudsucker creates per request/response under MITM.
-    maps: Arc<Mutex<HashMap<SocketAddr, (Instant, PlaceholderMap)>>>,
+    /// The `PlaceholderMap` minted for THIS request by
+    /// `handle_request`, retrieved by `handle_response` on the same
+    /// handler clone. `None` after creation, after the response has
+    /// consumed it, or when nothing on the outbound side matched any
+    /// detector. Each in-flight request owns its own clone of
+    /// `AichuHandler` (see module-level State threading note) so this
+    /// field never has to mediate between concurrent streams.
+    current_map: Option<PlaceholderMap>,
 }
 
 impl AichuHandler {
@@ -136,7 +110,7 @@ fn is_prompt_endpoint(path: &str) -> bool {
 impl HttpHandler for AichuHandler {
     async fn handle_request(
         &mut self,
-        ctx: &HttpContext,
+        _ctx: &HttpContext,
         req: Request<Body>,
     ) -> RequestOrResponse {
         self.request_count.fetch_add(1, Ordering::Relaxed);
@@ -187,24 +161,15 @@ impl HttpHandler for AichuHandler {
             }
         };
 
-        // Store the map so handle_response (likely a separate clone)
-        // can retrieve it. Only insert if non-empty — saves us a
-        // lookup on the response side when nothing was redacted.
-        //
-        // Sweep stale entries on the SAME lock acquisition whether
-        // or not we're about to insert: this is the cheapest place
-        // to do TTL cleanup (we already hold the mutex on every
-        // prompt-endpoint request, regardless of secret presence).
-        // If sweep only ran when inserting, a stream of non-secret
-        // prompt requests would let prior orphans linger past their
-        // TTL until the next secret-bearing request arrived.
-        let now = Instant::now();
-        {
-            let mut maps = self.maps.lock().unwrap();
-            sweep_stale(&mut maps, now, ENTRY_TTL);
-            if !map.is_empty() {
-                maps.insert(ctx.client_addr, (now, map));
-            }
+        // Hand the map off to handle_response via the per-clone field.
+        // Only stash if non-empty — keeps the response-side check a
+        // single Option match. Each in-flight request runs on its own
+        // clone (see module-level State threading note), so there is
+        // no concurrent writer to coordinate with and no orphan to
+        // sweep: the field is dropped with the clone if the response
+        // path never runs.
+        if !map.is_empty() {
+            self.current_map = Some(map);
         }
 
         // The body length probably changed after redaction; strip the
@@ -230,7 +195,7 @@ impl HttpHandler for AichuHandler {
 
     async fn handle_response(
         &mut self,
-        ctx: &HttpContext,
+        _ctx: &HttpContext,
         res: Response<Body>,
     ) -> Response<Body> {
         // Owned String so we can use `ct` after `res` is moved via
@@ -244,13 +209,14 @@ impl HttpHandler for AichuHandler {
             .to_string();
         tracing::info!(status = %res.status(), content_type = %ct, "response");
 
-        // Retrieve (and remove) the per-request map. Absent → nothing
-        // was redacted on the outbound side → pass response through
-        // unchanged. Streaming UX preserved for the no-secret case.
-        // Discard the insertion timestamp — it only mattered for the
-        // TTL sweep on the insert path.
-        let map = match self.maps.lock().unwrap().remove(&ctx.client_addr) {
-            Some((_inserted_at, m)) => m,
+        // Take the per-request map off this handler clone. Absent →
+        // nothing was redacted on the outbound side → pass response
+        // through unchanged. Streaming UX preserved for the no-secret
+        // case. `take()` empties the slot so a clone reuse (which
+        // hudsucker does not currently do, but could) cannot leak the
+        // map into a later unrelated request.
+        let map = match self.current_map.take() {
+            Some(m) => m,
             None => return res,
         };
 
@@ -393,114 +359,3 @@ where
     )
 }
 
-/// Remove entries whose insertion time is older than `now - ttl`.
-/// Pure (the timestamp is injected, not read from the clock) so unit
-/// tests can drive both branches deterministically without sleeping.
-fn sweep_stale(
-    maps: &mut HashMap<SocketAddr, (Instant, PlaceholderMap)>,
-    now: Instant,
-    ttl: Duration,
-) {
-    maps.retain(|_, (inserted_at, _)| now.duration_since(*inserted_at) < ttl);
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::net::Ipv4Addr;
-
-    fn addr(last_octet: u8) -> SocketAddr {
-        SocketAddr::from((Ipv4Addr::new(127, 0, 0, last_octet), 0))
-    }
-
-    #[test]
-    fn sweep_stale_removes_entries_older_than_ttl() {
-        // An entry inserted 30 minutes ago should be evicted when TTL
-        // is 15 minutes. The privacy guarantee is unchanged (an
-        // orphaned entry can never reverse a response that's never
-        // coming), but bounded memory is the contract this test
-        // pins.
-        let now = Instant::now();
-        let ttl = Duration::from_secs(15 * 60);
-        let mut maps = HashMap::new();
-        maps.insert(
-            addr(1),
-            (now - Duration::from_secs(30 * 60), PlaceholderMap::new()),
-        );
-        sweep_stale(&mut maps, now, ttl);
-        assert!(maps.is_empty(), "expected stale entry to be removed");
-    }
-
-    #[test]
-    fn sweep_stale_keeps_fresh_entries() {
-        // An entry inserted 1 minute ago must NOT be evicted under a
-        // 15-minute TTL — that would break the response-side reverse
-        // pass on a still-in-flight request.
-        let now = Instant::now();
-        let ttl = Duration::from_secs(15 * 60);
-        let mut maps = HashMap::new();
-        maps.insert(
-            addr(1),
-            (now - Duration::from_secs(60), PlaceholderMap::new()),
-        );
-        sweep_stale(&mut maps, now, ttl);
-        assert_eq!(maps.len(), 1, "fresh entry should remain");
-    }
-
-    #[test]
-    fn sweep_stale_partitions_mixed_entries() {
-        // Mixed fresh + stale: only the stale ones drop. Exercises
-        // the partition behavior of `HashMap::retain` on this map
-        // shape, including the timestamp-comparison direction (older
-        // than TTL = evict).
-        let now = Instant::now();
-        let ttl = Duration::from_secs(15 * 60);
-        let mut maps = HashMap::new();
-        let fresh = addr(1);
-        let stale_a = addr(2);
-        let stale_b = addr(3);
-        let recent = addr(4);
-        maps.insert(fresh, (now - Duration::from_secs(60), PlaceholderMap::new()));
-        maps.insert(
-            stale_a,
-            (now - Duration::from_secs(30 * 60), PlaceholderMap::new()),
-        );
-        maps.insert(
-            stale_b,
-            (now - Duration::from_secs(20 * 60), PlaceholderMap::new()),
-        );
-        maps.insert(
-            recent,
-            (now - Duration::from_secs(5 * 60), PlaceholderMap::new()),
-        );
-        sweep_stale(&mut maps, now, ttl);
-        assert!(maps.contains_key(&fresh));
-        assert!(maps.contains_key(&recent));
-        assert!(!maps.contains_key(&stale_a));
-        assert!(!maps.contains_key(&stale_b));
-    }
-
-    #[test]
-    fn sweep_stale_on_empty_map_is_a_noop() {
-        // Defensive: the function must not panic on an empty map.
-        // Calling sweep on every insert means empty-map cases happen
-        // on the first request after startup.
-        let mut maps: HashMap<SocketAddr, (Instant, PlaceholderMap)> = HashMap::new();
-        sweep_stale(&mut maps, Instant::now(), Duration::from_secs(15 * 60));
-        assert!(maps.is_empty());
-    }
-
-    #[test]
-    fn sweep_stale_boundary_at_exactly_ttl_evicts() {
-        // The comparison is `now - inserted < ttl`, so an entry at
-        // EXACTLY ttl is evicted (`duration_since == ttl` is NOT
-        // less than `ttl`). Pin this boundary so a future refactor
-        // that flips to `<=` would surface here.
-        let now = Instant::now();
-        let ttl = Duration::from_secs(15 * 60);
-        let mut maps = HashMap::new();
-        maps.insert(addr(1), (now - ttl, PlaceholderMap::new()));
-        sweep_stale(&mut maps, now, ttl);
-        assert!(maps.is_empty(), "entry at exactly TTL should be evicted");
-    }
-}

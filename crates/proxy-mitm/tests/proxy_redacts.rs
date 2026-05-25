@@ -323,6 +323,235 @@ async fn mitm_phase_2c_reverses_placeholder_split_across_sse_events() -> Result<
     Ok(())
 }
 
+/// HTTP/2 multiplexing regression test.
+///
+/// Why this test exists: under HTTPS CONNECT MITM, a single TCP
+/// connection from the client can carry multiple concurrent HTTP/2
+/// streams. The handler used to key its per-request PlaceholderMap by
+/// `HttpContext.client_addr` alone — but every stream on a multiplexed
+/// connection shares the same `client_addr`. Two in-flight requests
+/// would race on the same map slot:
+///
+///   - request A inserts map_A at client_addr
+///   - request B inserts map_B at client_addr, OVERWRITING map_A
+///   - response A arrives, looks up client_addr, finds map_B, and
+///     reverses A's body using B's secret→placeholder table
+///   - response B arrives, looks up client_addr, finds nothing, and
+///     passes B's body through with the placeholder text intact
+///
+/// Both branches are privacy bugs: branch 1 leaks request B's SECRET
+/// into request A's response stream (the original mints a fresh `_001`
+/// counter per map, so the same placeholder string `«SECRET_AWS_KEY_001»`
+/// names DIFFERENT real secrets across the two maps); branch 2 leaks
+/// the placeholder itself into the client's view of B's response.
+///
+/// This test pins the invariant: **request A's response must carry
+/// A's own secret restored, and request B's response must carry B's.**
+/// If a future refactor reintroduces same-key collisions, the
+/// assertions below will fire with a self-documenting message.
+///
+/// We can't reproduce the race with the `reqwest::Proxy::http` clients
+/// used by the other tests in this file: reqwest's HTTP/1.1 pool
+/// refuses to pipeline, so two concurrent calls land on two TCP
+/// connections (two `client_addr`s, no collision). The deterministic
+/// repro speaks HTTP/2 over a raw TCP socket via the `h2` crate, which
+/// gives us full control over stream interleaving on one connection.
+/// Hyper's auto::Builder (the connection server hudsucker hands to its
+/// outer `service_fn`) probes the H2 preface and switches into HTTP/2
+/// mode, so the proxy treats both our streams as one client_addr.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mitm_isolates_concurrent_h2_streams_on_one_connection() -> Result<()> {
+    use bytes::Bytes as H2Bytes;
+    use http::Request as H2Request;
+
+    let upstream = spawn_echoing_upstream("/v1/messages").await?;
+    let ca_dir = TempDir::new()?;
+    let ca = load_or_create_ca(ca_dir.path())?;
+    let handler = AichuHandler::new();
+    let (proxy_addr, shutdown_tx) = spawn_proxy(ca.authority, handler).await?;
+
+    // Distinct AWS keys so each map slot mints `«SECRET_AWS_KEY_001»`
+    // independently — same placeholder STRING, different real secrets.
+    // That collision is exactly the cross-contamination signal: if A's
+    // response gets reversed with B's map, A would echo B's secret.
+    let secret_a = "AKIAAAAAAAAAAAAAAAAA";
+    let secret_b = "AKIABBBBBBBBBBBBBBBB";
+    let body_a = format!(
+        r#"{{"model":"m","max_tokens":1,"messages":[{{"role":"user","content":"req-a uses {secret_a}"}}]}}"#
+    );
+    let body_b = format!(
+        r#"{{"model":"m","max_tokens":1,"messages":[{{"role":"user","content":"req-b uses {secret_b}"}}]}}"#
+    );
+
+    // Wrap the whole H2 round-trip in an outer timeout so a regression
+    // that wedges the proxy surfaces as a clear failure rather than
+    // hanging the test binary.
+    let round_trip = async {
+        // One raw TCP connection to the proxy → one `client_addr`. h2
+        // handshake writes the HTTP/2 preface; hyper's auto::Builder
+        // detects it and serves HTTP/2 on this connection.
+        let tcp = TcpStream::connect(proxy_addr).await?;
+        let (mut h2_client, h2_conn) = h2::client::handshake(tcp).await?;
+        // Drive the connection in the background; we abort it once
+        // both responses are collected.
+        let conn_task = tokio::spawn(async move {
+            let _ = h2_conn.await;
+        });
+
+        let upstream_uri = format!("http://{}/v1/messages", upstream.addr);
+
+        // Send BOTH stream headers before sending either body, then write
+        // both bodies before reading either response. This guarantees the
+        // proxy's handle_request runs for stream A and stream B
+        // back-to-back — both would have collided on the per-client_addr
+        // map slot under the buggy keying — before either response can flow.
+        let req_a = H2Request::builder()
+            .method("POST")
+            .uri(&upstream_uri)
+            .body(())
+            .unwrap();
+        let req_b = H2Request::builder()
+            .method("POST")
+            .uri(&upstream_uri)
+            .body(())
+            .unwrap();
+
+        let (resp_a_fut, mut send_a) = h2_client.send_request(req_a, false).unwrap();
+        let (resp_b_fut, mut send_b) = h2_client.send_request(req_b, false).unwrap();
+
+        send_a.send_data(H2Bytes::from(body_a.clone()), true).unwrap();
+        send_b.send_data(H2Bytes::from(body_b.clone()), true).unwrap();
+
+        // Drop the SendRequest handle so the connection knows no
+        // further requests are coming. Otherwise h2 keeps the
+        // connection open waiting for more streams and the test never
+        // observes the end of the conversation.
+        drop(h2_client);
+
+        // Await both responses concurrently.
+        let (resp_a, resp_b) = tokio::try_join!(resp_a_fut, resp_b_fut)?;
+        assert_eq!(resp_a.status(), 200, "response A should be 200");
+        assert_eq!(resp_b.status(), 200, "response B should be 200");
+
+        let body_a_local = collect_h2_body(resp_a.into_body()).await?;
+        let body_b_local = collect_h2_body(resp_b.into_body()).await?;
+
+        conn_task.abort();
+        Ok::<(String, String), anyhow::Error>((body_a_local, body_b_local))
+    };
+
+    let (body_a_recv, body_b_recv) = match tokio::time::timeout(
+        Duration::from_secs(15),
+        round_trip,
+    )
+    .await
+    {
+        Ok(Ok(t)) => t,
+        Ok(Err(e)) => return Err(e),
+        Err(_) => anyhow::bail!(
+            "H2 round-trip timed out — likely a regression in proxy H2 \
+             handling or stream lifecycle. The race-condition assertions \
+             below cannot run without both responses."
+        ),
+    };
+
+    // Headline contract: each response must contain its OWN secret.
+    // The upstream echoes the (redacted) request body back in its
+    // response, so the response naturally carries the same placeholder
+    // string the proxy minted for that request. The reverse pass on
+    // the way back to the client MUST restore the correct secret per
+    // stream — i.e. it must look up the placeholder in THIS request's
+    // map, not whichever map happened to win the same-key race.
+    assert!(
+        body_a_recv.contains(secret_a),
+        "response A is missing its own secret ({secret_a}) — \
+         reverse pass used the wrong map (cross-stream contamination). \
+         Got: {body_a_recv}"
+    );
+    assert!(
+        !body_a_recv.contains(secret_b),
+        "response A leaked request B's secret ({secret_b}) into A's \
+         response stream — HTTP/2 multiplex race in PlaceholderMap \
+         keying. Got: {body_a_recv}"
+    );
+    assert!(
+        body_b_recv.contains(secret_b),
+        "response B is missing its own secret ({secret_b}). \
+         Got: {body_b_recv}"
+    );
+    assert!(
+        !body_b_recv.contains(secret_a),
+        "response B leaked request A's secret ({secret_a}) into B's \
+         response stream. Got: {body_b_recv}"
+    );
+
+    // No placeholder should reach either client; the reverse pass must
+    // have run successfully against the right map for each stream.
+    assert!(
+        !body_a_recv.contains("\u{ab}SECRET_"),
+        "placeholder leaked into response A: {body_a_recv}"
+    );
+    assert!(
+        !body_b_recv.contains("\u{ab}SECRET_"),
+        "placeholder leaked into response B: {body_b_recv}"
+    );
+
+    let _ = shutdown_tx.send(());
+    Ok(())
+}
+
+async fn collect_h2_body(mut body: h2::RecvStream) -> Result<String> {
+    let mut buf = Vec::new();
+    while let Some(chunk) = body.data().await {
+        let chunk = chunk?;
+        let _ = body.flow_control().release_capacity(chunk.len());
+        buf.extend_from_slice(&chunk);
+    }
+    Ok(String::from_utf8(buf)?)
+}
+
+/// Upstream that echoes the request body back inside a JSON response.
+/// Used by the H2 multiplex test: we want the response to naturally
+/// carry the same placeholder the proxy minted on the outbound side,
+/// so the reverse-pass keying bug becomes observable on the client.
+async fn spawn_echoing_upstream(path: &'static str) -> Result<CapturingUpstream> {
+    let state = CapturingState {
+        request_count: Arc::new(AtomicU64::new(0)),
+        last_body: Arc::new(std::sync::Mutex::new(None)),
+    };
+    let request_count = state.request_count.clone();
+    let last_body = state.last_body.clone();
+
+    let app = Router::new().route(path, post(echo_handler)).with_state(state);
+
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    Ok(CapturingUpstream {
+        addr,
+        request_count,
+        last_body,
+    })
+}
+
+async fn echo_handler(State(state): State<CapturingState>, body: Bytes) -> Json<Value> {
+    state.request_count.fetch_add(1, Ordering::Relaxed);
+    *state.last_body.lock().unwrap() = Some(body.clone());
+    // Echo the request body verbatim inside a JSON response. The
+    // placeholder the proxy minted upstream lives in `body`; surfacing
+    // it in the response is what makes the round-trip privacy
+    // invariant testable.
+    let echoed = String::from_utf8_lossy(&body).into_owned();
+    Json(json!({
+        "id": "msg_echo",
+        "type": "message",
+        "content": [{"type": "text", "text": echoed}],
+    }))
+}
+
 async fn spawn_upstream_returning_sse_with_split_placeholder(
     path: &'static str,
 ) -> Result<CapturingUpstream> {
