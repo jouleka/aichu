@@ -9,10 +9,11 @@
 //   - `aichu untrust`         — remove the local CA from the OS trust store
 //   - `aichu doctor`          — diagnose common setup issues
 //
-// Trust automation is implemented for macOS (System keychain) and
-// Linux (Debian-family via `/usr/local/share/ca-certificates/`, Red Hat-
-// family via `/etc/pki/ca-trust/source/anchors/`, Arch-family via
-// `/etc/ca-certificates/trust-source/anchors/`); other OSes get a bail
+// Trust automation is implemented for macOS (System keychain), Linux
+// (Debian-family via `/usr/local/share/ca-certificates/`, Red Hat-family
+// via `/etc/pki/ca-trust/source/anchors/`, Arch-family via
+// `/etc/ca-certificates/trust-source/anchors/`), and Windows (per-user
+// `Cert:\CurrentUser\Root` via `certutil.exe`); other OSes get a bail
 // with manual instructions.
 //
 // Subcommands are NEVER stubbed — no speculative code (CLAUDE.md Rule 2).
@@ -43,11 +44,13 @@ enum Commands {
     /// bodies (default ON; the e03 eval measured it lifts secret-
     /// placeholder echo accuracy from 12% to 96% on gpt-5-mini).
     Run(RunArgs),
-    /// Install the local CA into the OS trust store (macOS System keychain
-    /// or Linux: Debian/Red Hat/Arch families; requires sudo).
+    /// Install the local CA into the OS trust store (macOS System keychain,
+    /// Linux Debian/Red Hat/Arch families [requires sudo], or Windows
+    /// per-user `CurrentUser\Root` via certutil [no UAC]).
     Trust,
-    /// Remove the local CA from the OS trust store (macOS or Linux:
-    /// Debian/Red Hat/Arch families; requires sudo).
+    /// Remove the local CA from the OS trust store (macOS, Linux
+    /// Debian/Red Hat/Arch families [requires sudo], or Windows per-user
+    /// `CurrentUser\Root` via certutil [no UAC]).
     Untrust,
     /// Diagnose common setup issues (CA presence, trust-store install, HTTPS_PROXY, port).
     Doctor,
@@ -356,22 +359,66 @@ fn handle_untrust() -> Result<()> {
     }
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+// ---- Windows trust automation (CurrentUser\Root via certutil) -------------
+
+/// The Windows certificate-store name we install into. `Root` selects the
+/// Trusted Root Certification Authorities store; pairing it with `-user`
+/// scopes the install to the current user account (HKEY_CURRENT_USER,
+/// per Microsoft Learn). The asymmetry with macOS (which installs into
+/// the System keychain) is deliberate: macOS's System keychain is no
+/// more invasive than logging in, but Windows's LocalMachine\Root would
+/// require UAC elevation and the v0 threat model doesn't need it. Users
+/// run their coding agents under their own account; per-user trust is
+/// sufficient.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+const WINDOWS_TRUST_STORE: &str = "Root";
+
+#[cfg(target_os = "windows")]
+fn handle_trust() -> Result<()> {
+    let cert_path = ca_dir()?.join(proxy_mitm::ca::CERT_FILENAME);
+    if !cert_path.exists() {
+        anyhow::bail!(
+            "CA not generated yet — run `aichu run` once to create it at {}, \
+             then re-run `aichu trust`",
+            cert_path.display()
+        );
+    }
+    let mut cmd = windows_trust_command(&cert_path);
+    tracing::info!(
+        "installing CA into CurrentUser\\Root (no UAC needed) (cert: {})",
+        cert_path.display()
+    );
+    run_or_bail(&mut cmd, "trust install")?;
+    tracing::info!("CA installed into the Windows CurrentUser\\Root store ✓");
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn handle_untrust() -> Result<()> {
+    let mut cmd = windows_untrust_command(proxy_mitm::ca::COMMON_NAME);
+    tracing::info!(
+        "removing CA \"{}\" from CurrentUser\\Root (no UAC needed)",
+        proxy_mitm::ca::COMMON_NAME
+    );
+    run_or_bail(&mut cmd, "trust removal")?;
+    tracing::info!("CA removed from the Windows CurrentUser\\Root store ✓");
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
 fn handle_trust() -> Result<()> {
     anyhow::bail!(
-        "`aichu trust` is macOS- and Linux-only in v0. On Windows, install \
-         `~/.aichu/ca/aichu-ca.pem` into the Local Machine \\ Trusted Root \
-         Certification Authorities store via `certutil -addstore root <pem>` \
-         from an elevated shell."
+        "`aichu trust` is macOS, Linux, and Windows-only in v0. Install \
+         `~/.aichu/ca/aichu-ca.pem` into your platform's root trust store \
+         manually."
     )
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
 fn handle_untrust() -> Result<()> {
     anyhow::bail!(
-        "`aichu untrust` is macOS- and Linux-only in v0. On Windows, remove \
-         the CA via `certutil -delstore root \"aichu local proxy CA\"` from \
-         an elevated shell."
+        "`aichu untrust` is macOS, Linux, and Windows-only in v0. Remove \
+         the CA from your platform's root trust store manually."
     )
 }
 
@@ -577,10 +624,89 @@ fn untrust_command(common_name: &str, keychain: &Path) -> Command {
     cmd
 }
 
+/// Build `certutil.exe -user -addstore Root <cert>`. Pure builder — tests
+/// pin the argv shape; `run_or_bail` does the actual invocation.
+///
+/// `-user` is what keeps the install per-user (HKEY_CURRENT_USER) and
+/// therefore UAC-free, per Microsoft Learn's certutil docs. `Root`
+/// (the store name) maps to the Trusted Root Certification Authorities
+/// store. A regression that drops `-user` would silently demand UAC and
+/// break unattended installs — the `windows_trust_invokes_certutil_with_user_addstore_root_argv`
+/// test exists to make that show up as a unit-test failure, not a runtime
+/// surprise.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn windows_trust_command(cert_path: &Path) -> Command {
+    let mut cmd = Command::new("certutil.exe");
+    cmd.arg("-user")
+        .arg("-addstore")
+        .arg(WINDOWS_TRUST_STORE)
+        .arg(cert_path);
+    cmd
+}
+
+/// Build `certutil.exe -user -delstore Root "<CN>"`. CN-based identification
+/// (CertId matches subject common name substring per Microsoft Learn's
+/// `-store` CertId-tokens doc; `-delstore` shares the CertId concept and
+/// accepts the same forms in practice) means `aichu untrust` works even
+/// after the local PEM file has been deleted — same property as the macOS
+/// path (which also matches by CN).
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn windows_untrust_command(common_name: &str) -> Command {
+    let mut cmd = Command::new("certutil.exe");
+    cmd.arg("-user")
+        .arg("-delstore")
+        .arg(WINDOWS_TRUST_STORE)
+        .arg(common_name);
+    cmd
+}
+
+/// Build `certutil.exe -user -store Root "<CN>"`. Read-only lookup used by
+/// `aichu doctor`. Exit 0 → cert is present in the user's Root store;
+/// exit non-zero → absent (mapped to `CheckResult::Fail` so doctor's
+/// signal matches what `aichu trust` would do on the same host —
+/// Rule 12, fail loud).
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn windows_doctor_check_command(common_name: &str) -> Command {
+    let mut cmd = Command::new("certutil.exe");
+    cmd.arg("-user")
+        .arg("-store")
+        .arg(WINDOWS_TRUST_STORE)
+        .arg(common_name);
+    cmd
+}
+
+/// The doctor branch wraps `windows_doctor_check_command` and interprets
+/// the exit code. Pure (takes a runner closure) so unit tests can substitute
+/// a fake without invoking certutil — mirrors the existing `is_debian_family`
+/// closure-injection pattern. Exit 0 → Ok; anything else → Fail with a
+/// `aichu trust` hint. Rule 12: never Warn for an absent CA, because
+/// `aichu trust` would actually run (exit 0 from a successful install)
+/// on this same host.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn check_windows_currentuser_root<F>(common_name: &str, run: F) -> CheckResult
+where
+    F: FnOnce(&mut Command) -> std::io::Result<std::process::ExitStatus>,
+{
+    let mut cmd = windows_doctor_check_command(common_name);
+    match run(&mut cmd) {
+        Ok(status) if status.success() => {
+            CheckResult::Ok(format!("CA \"{common_name}\" present in CurrentUser\\Root"))
+        }
+        Ok(_) => CheckResult::Fail {
+            message: format!("CA \"{common_name}\" is not installed in CurrentUser\\Root"),
+            hint: "run `aichu trust` to install it (no UAC needed)".into(),
+        },
+        Err(e) => CheckResult::Fail {
+            message: format!("could not invoke `certutil.exe`: {e}"),
+            hint: "is certutil.exe on PATH? (it ships with Windows since Win2k)".into(),
+        },
+    }
+}
+
 /// Spawn a `Command` synchronously, bail with the original exit code if it
 /// fails. Centralized so trust + untrust report errors the same way on
 /// every platform where the live handler invokes a subprocess.
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 fn run_or_bail(cmd: &mut Command, what: &str) -> Result<()> {
     let status = cmd
         .status()
@@ -859,6 +985,11 @@ fn handle_doctor() -> Result<()> {
         ),
         #[cfg(target_os = "linux")]
         linux_doctor_trust_source_check(),
+        #[cfg(target_os = "windows")]
+        (
+            "CA in CurrentUser\\Root (Windows)",
+            check_windows_currentuser_root(proxy_mitm::ca::COMMON_NAME, |c| c.status()),
+        ),
     ];
 
     for (label, result) in &checks {
@@ -1092,29 +1223,30 @@ mod tests {
         assert_eq!(args[3], "weird CN with spaces & symbols!");
     }
 
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     #[test]
     fn handle_trust_returns_unsupported_on_unsupported_os() {
         // The unsupported-OS error must name the platform constraint so
         // users know it's deliberate, not a missing dependency. Compare-
         // by-substring is intentionally loose to allow message tweaks.
-        // Currently fires only on Windows + BSDs + Solaris.
+        // Currently fires only on BSDs + Solaris (macOS, Linux, and
+        // Windows all have shipping handlers).
         let err = handle_trust().expect_err("unsupported-OS trust should error");
         let msg = err.to_string();
         assert!(
-            msg.contains("macOS") && msg.contains("Linux"),
-            "unsupported-OS trust error should mention macOS and Linux: {msg}"
+            msg.contains("macOS") && msg.contains("Linux") && msg.contains("Windows"),
+            "unsupported-OS trust error should mention macOS, Linux, and Windows: {msg}"
         );
     }
 
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     #[test]
     fn handle_untrust_returns_unsupported_on_unsupported_os() {
         let err = handle_untrust().expect_err("unsupported-OS untrust should error");
         let msg = err.to_string();
         assert!(
-            msg.contains("macOS") && msg.contains("Linux"),
-            "unsupported-OS untrust error should mention macOS and Linux: {msg}"
+            msg.contains("macOS") && msg.contains("Linux") && msg.contains("Windows"),
+            "unsupported-OS untrust error should mention macOS, Linux, and Windows: {msg}"
         );
     }
 
@@ -1605,6 +1737,153 @@ mod tests {
             other => panic!("expected Fail, got {other:?}"),
         }
     }
+
+    // ---- Windows trust automation (CurrentUser\Root via certutil) ---------
+    //
+    // The Windows code path is `#[cfg(target_os = "windows")]` gated, but the
+    // pure argv builders are cross-OS-compiled (cfg_attr allow(dead_code) on
+    // non-Windows) so these tests exercise them from macOS/Linux CI. This
+    // matches the pattern used for the macOS `trust_command` /
+    // `untrust_command` argv-pin tests, which also run cross-OS.
+    //
+    // What these tests DON'T prove: that certutil.exe actually accepts these
+    // command lines on a live Windows host. They prove the argv shape — drift
+    // toward LocalMachine\Root (which would prompt UAC) or dropping `-user`
+    // (same effect) becomes a test failure here, not a runtime surprise.
+    // A real Windows runner in CI is the proper validator for the integration.
+    #[test]
+    fn windows_trust_invokes_certutil_with_user_addstore_root_argv() {
+        // Pin: `certutil.exe -user -addstore Root <cert>`. The `-user` flag
+        // is load-bearing — without it certutil defaults to LocalMachine,
+        // which prompts UAC and breaks unattended use. Microsoft Learn
+        // documents `-user` as "targets HKEY_CURRENT_USER keys or stores",
+        // which is the property we depend on.
+        let cmd = windows_trust_command(Path::new(r"C:\Users\me\.aichu\ca\aichu-ca.pem"));
+        assert_eq!(cmd.get_program(), "certutil.exe");
+        let args: Vec<&str> = cmd.get_args().filter_map(|a| a.to_str()).collect();
+        assert_eq!(
+            args,
+            vec![
+                "-user",
+                "-addstore",
+                "Root",
+                r"C:\Users\me\.aichu\ca\aichu-ca.pem",
+            ]
+        );
+    }
+
+    #[test]
+    fn windows_untrust_invokes_certutil_with_user_delstore_root_argv() {
+        // Pin: `certutil.exe -user -delstore Root "aichu local proxy CA"`.
+        // CN-based identification (per Microsoft Learn's certutil -store /
+        // -delstore docs — CertId matches subject common name substring)
+        // keeps untrust working after the local PEM has been deleted,
+        // mirroring the macOS path's CN-based removal semantics.
+        let cmd = windows_untrust_command(proxy_mitm::ca::COMMON_NAME);
+        assert_eq!(cmd.get_program(), "certutil.exe");
+        let args: Vec<&str> = cmd.get_args().filter_map(|a| a.to_str()).collect();
+        assert_eq!(
+            args,
+            vec!["-user", "-delstore", "Root", "aichu local proxy CA",]
+        );
+    }
+
+    #[test]
+    fn windows_doctor_check_calls_certutil_user_store_root() {
+        // Pin: `certutil.exe -user -store Root "<CN>"`. The doctor probe
+        // must be read-only (no `-addstore` / `-delstore`) and scoped to
+        // the same `-user Root` we install into — otherwise doctor would
+        // report on the wrong store and miss a real install gap.
+        let cmd = windows_doctor_check_command(proxy_mitm::ca::COMMON_NAME);
+        assert_eq!(cmd.get_program(), "certutil.exe");
+        let args: Vec<&str> = cmd.get_args().filter_map(|a| a.to_str()).collect();
+        assert_eq!(
+            args,
+            vec!["-user", "-store", "Root", "aichu local proxy CA",]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn windows_doctor_fails_when_certutil_reports_no_match() {
+        // Exit 1 from `certutil -user -store` means "no matching cert" —
+        // doctor must report `Fail`, not `Warn` (Rule 12 — fail loud;
+        // mirroring the Linux behavior). The CI signal would otherwise
+        // be a Warn that users dismiss, while `aichu trust` would actually
+        // succeed on this same host. Closure-injection lets this test run
+        // on macOS/Linux CI without a real certutil — the injected runner
+        // returns a constructed nonzero ExitStatus.
+        use std::os::unix::process::ExitStatusExt;
+        let r = check_windows_currentuser_root(proxy_mitm::ca::COMMON_NAME, |_cmd| {
+            Ok(std::process::ExitStatus::from_raw(256))
+        });
+        match r {
+            CheckResult::Fail { hint, message } => {
+                assert!(
+                    hint.contains("aichu trust"),
+                    "absent-CA hint should point at `aichu trust`: {hint}"
+                );
+                assert!(
+                    message.contains("not installed"),
+                    "absent-CA message should describe the install gap: {message}"
+                );
+            }
+            other => panic!(
+                "absent CA must be Fail (mirroring `aichu trust` exit), got {other:?}"
+            ),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn windows_doctor_ok_when_certutil_exits_zero() {
+        // Exit 0 from `certutil -user -store` means the cert is present —
+        // doctor reports Ok. Together with the Fail-on-nonzero test above
+        // this pins the binary success/fail mapping.
+        use std::os::unix::process::ExitStatusExt;
+        let r = check_windows_currentuser_root(proxy_mitm::ca::COMMON_NAME, |_cmd| {
+            Ok(std::process::ExitStatus::from_raw(0))
+        });
+        assert!(matches!(r, CheckResult::Ok(_)), "got {r:?}");
+    }
+
+    #[test]
+    fn windows_doctor_fails_when_certutil_cannot_be_invoked() {
+        // Io error from spawning certutil (e.g. it's not on PATH — vanishingly
+        // unlikely on Windows but possible if the user has a stripped image)
+        // must NOT be misreported as "CA not installed". The hint must point
+        // at the environmental problem, not at `aichu trust`. Mirrors the
+        // macOS `interpret_find_certificate_output_surfaces_unexpected_stderr`
+        // intent: don't send the user chasing the wrong fix.
+        let r = check_windows_currentuser_root(proxy_mitm::ca::COMMON_NAME, |_cmd| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "certutil.exe not on PATH",
+            ))
+        });
+        match r {
+            CheckResult::Fail { hint, message } => {
+                assert!(
+                    hint.contains("certutil.exe") && hint.contains("PATH"),
+                    "io-error hint should mention certutil + PATH: {hint}"
+                );
+                assert!(
+                    !message.contains("not installed"),
+                    "io-error message must NOT be reported as 'not installed': {message}"
+                );
+            }
+            other => panic!("expected Fail for io error, got {other:?}"),
+        }
+    }
+
+    // `windows_trust_fails_loud_when_certutil_returns_nonzero`: the equivalent
+    // assertion for the trust-write path is structural rather than a separate
+    // test — `handle_trust` on Windows delegates to `run_or_bail`, which is
+    // the same helper macOS/Linux trust use. `run_or_bail`'s contract (bail
+    // on nonzero exit) is covered by the existing macOS/Linux integration
+    // path; adding a Windows-specific test would duplicate it without
+    // exercising new behavior. The argv-pin test above is the load-bearing
+    // Windows-specific safeguard.
 
     #[cfg(unix)]
     #[test]
