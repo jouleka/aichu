@@ -34,7 +34,14 @@ impl OpenAiProvider {
             model_id,
             base_url: DEFAULT_BASE_URL.to_string(),
             api_key: api_key.into(),
-            max_tokens: 512,
+            // 2048, not 512. gpt-5-mini and other reasoning-capable models
+            // count internal reasoning tokens against `max_completion_tokens`.
+            // 512 left zero budget for visible output in smoke tests against
+            // gpt-5-mini (entire budget spent on reasoning, `content` empty,
+            // `preserved=false` for every fixture). Combined with
+            // `reasoning_effort: "minimal"` in `complete()`, 2048 leaves a
+            // safe headroom for the actual response.
+            max_tokens: 2048,
             client: reqwest::Client::new(),
         }
     }
@@ -59,9 +66,21 @@ impl Model for OpenAiProvider {
         // models"; gpt-5-mini and other newer reasoning-capable models
         // expect `max_completion_tokens`. Picking the newer name here
         // keeps us forward-compatible without branching per model id.
+        //
+        // `reasoning_effort: "minimal"` opts out of extended thinking on
+        // reasoning-capable models (gpt-5-series, o-series). The
+        // placeholder-preservation eval measures whether the model echoes
+        // a token verbatim in its output text — a question about text
+        // handling, not about reasoning depth. Without this, gpt-5-mini
+        // spends its entire token budget on reasoning and emits empty
+        // `content`, yielding no usable eval signal. Non-reasoning OpenAI
+        // models (gpt-4o, gpt-3.5) may reject or silently ignore the
+        // parameter; gate on model id before pointing this provider at
+        // them (e.g. `model_id.starts_with("gpt-5") || starts_with("o")`).
         let body = json!({
             "model": self.model_id,
             "max_completion_tokens": self.max_tokens,
+            "reasoning_effort": "minimal",
             "messages": [{"role": "user", "content": prompt}],
         });
 

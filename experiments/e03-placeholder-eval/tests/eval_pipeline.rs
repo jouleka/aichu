@@ -224,6 +224,26 @@ async fn openai_provider_speaks_correct_wire_shape_against_mock() -> Result<()> 
             .contains("\u{ab}SECRET_GENERIC_001\u{bb}"),
         "mock should have received the substituted prompt; got {user_content}"
     );
+    // Pin the reasoning-effort opt-out and the bumped max_completion_tokens
+    // budget. Both are load-bearing for gpt-5-mini: without
+    // `reasoning_effort=minimal` the model spends its entire budget on
+    // hidden reasoning and emits empty content, and with the older
+    // 512-token budget there is no headroom for any visible output.
+    // A regression that drops either field would silently zero-out the
+    // eval's signal on reasoning-capable models -- exactly the failure
+    // mode this test exists to catch (CLAUDE.md Rule 9). Non-reasoning
+    // OpenAI models (gpt-4o, gpt-3.5) may reject or silently ignore the
+    // parameter; gate on model id before pointing this provider at them.
+    assert_eq!(
+        saw.body["reasoning_effort"], "minimal",
+        "reasoning_effort=minimal opts out of internal reasoning so the \
+         model uses its token budget for visible output"
+    );
+    assert_eq!(
+        saw.body["max_completion_tokens"], 2048,
+        "max_completion_tokens must leave headroom for reasoning-capable \
+         models; 512 was empirically too low for gpt-5-mini"
+    );
     Ok(())
 }
 
