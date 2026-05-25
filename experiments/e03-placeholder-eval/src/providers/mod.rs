@@ -10,3 +10,4 @@
 //      mock server (axum) without hitting the real API.
 
 pub mod anthropic;
+pub mod openai;

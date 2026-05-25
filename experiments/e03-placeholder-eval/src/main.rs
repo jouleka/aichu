@@ -17,7 +17,7 @@ use clap::Parser;
 
 use e03_placeholder_eval::{
     PlaceholderFormat, evaluate, load_fixtures, model::Model,
-    providers::anthropic::AnthropicProvider,
+    providers::{anthropic::AnthropicProvider, openai::OpenAiProvider},
 };
 
 #[derive(Debug, Parser)]
@@ -27,11 +27,12 @@ struct Args {
     #[arg(long)]
     prompts: PathBuf,
 
-    /// Provider to run against. Currently only `anthropic` is implemented.
+    /// Provider to run against: `anthropic` or `openai`.
     #[arg(long, default_value = "anthropic")]
     provider: String,
 
-    /// Anthropic model id (e.g. `claude-opus-4-7-20250514`).
+    /// Anthropic model id (e.g. `claude-opus-4-7-20250514`), or an OpenAI
+    /// model id (e.g. `gpt-5-mini`) when `--provider openai`.
     #[arg(long, default_value = "claude-opus-4-7-20250514")]
     model: String,
 
@@ -66,7 +67,12 @@ async fn main() -> Result<()> {
                 .context("set $ANTHROPIC_API_KEY for --provider anthropic")?;
             Box::new(AnthropicProvider::new(&args.model, api_key))
         }
-        other => anyhow::bail!("unknown provider {other:?}; supported: anthropic"),
+        "openai" => {
+            let api_key = std::env::var("OPENAI_API_KEY")
+                .context("set $OPENAI_API_KEY for --provider openai")?;
+            Box::new(OpenAiProvider::new(&args.model, api_key))
+        }
+        other => anyhow::bail!("unknown provider {other:?}; supported: anthropic, openai"),
     };
 
     let mut results = Vec::with_capacity(fixtures.len() * formats.len());

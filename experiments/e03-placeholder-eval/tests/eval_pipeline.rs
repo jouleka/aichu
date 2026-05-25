@@ -1,6 +1,6 @@
 //! Integration tests for the e03 eval pipeline.
 //!
-//! Two contracts under test:
+//! Three contracts under test:
 //!
 //!   1. `evaluate()` reports `preserved=true` when the model echoes the
 //!      prompt (placeholder survives) and `false` when it doesn't.
@@ -9,6 +9,12 @@
 //!      against an axum mock server pretending to be Anthropic. Validates
 //!      auth headers, request body shape, and response parsing — without
 //!      any API budget burn.
+//!
+//!   3. `OpenAiProvider` correctly speaks the `/v1/chat/completions` wire
+//!      shape against an axum mock server pretending to be OpenAI.
+//!      Validates `Authorization: Bearer` header, request body shape, and
+//!      response parsing (`choices[0].message.content`, `usage.prompt_tokens`
+//!      / `usage.completion_tokens`) — without any API budget burn.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -28,7 +34,7 @@ use tokio::net::{TcpListener, TcpStream};
 use e03_placeholder_eval::{
     PlaceholderFormat, evaluate,
     model::{EchoModel, StaticModel},
-    providers::anthropic::AnthropicProvider,
+    providers::{anthropic::AnthropicProvider, openai::OpenAiProvider},
 };
 
 #[tokio::test]
@@ -162,12 +168,77 @@ async fn anthropic_provider_speaks_correct_wire_shape_against_mock() -> Result<(
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn openai_provider_speaks_correct_wire_shape_against_mock() -> Result<()> {
+    // Verifies: OpenAiProvider sends POST /v1/chat/completions with the
+    // right `Authorization: Bearer` header, the right JSON body shape
+    // (model + messages array), and parses the response
+    // `choices[0].message.content` + `usage.{prompt,completion}_tokens`
+    // back out correctly. No API budget burned — we run against a local
+    // axum server pretending to be OpenAI.
+    //
+    // Why this test exists (CLAUDE.md Rule 9): a regression in the auth
+    // header (e.g., reverting to `x-api-key`), the endpoint path, the
+    // body shape, or the response parser (e.g., reading `output_tokens`
+    // instead of `completion_tokens`) would fail this test BEFORE any
+    // real API call burns budget.
+    let mock = spawn_openai_mock("Hello from the OpenAI mock model.").await?;
+
+    let provider = OpenAiProvider::new("gpt-5-mini-test", "sk-openai-mock-key")
+        .with_base_url(format!("http://{}", mock.addr));
+
+    let r = evaluate(
+        "mock-fixture",
+        "Please echo PLACEHOLDER_VALUE back.",
+        "PLACEHOLDER_VALUE",
+        "GENERIC",
+        PlaceholderFormat::Guillemets,
+        1,
+        &provider,
+    )
+    .await?;
+
+    assert_eq!(r.model, "openai:gpt-5-mini-test");
+    assert_eq!(r.response_excerpt, "Hello from the OpenAI mock model.");
+    assert_eq!(r.input_tokens, Some(13));
+    assert_eq!(r.output_tokens, Some(9));
+    // Our mock model's response doesn't contain the placeholder.
+    assert!(!r.preserved);
+
+    // Mock must have seen exactly one request with the Bearer auth header.
+    let saw = mock.last_seen.lock().unwrap().clone();
+    assert_eq!(mock.request_count.load(Ordering::Relaxed), 1);
+    let saw = saw.expect("mock should have captured one request");
+    assert_eq!(
+        saw.authorization.as_deref(),
+        Some("Bearer sk-openai-mock-key"),
+        "OpenAI uses Authorization: Bearer, NOT x-api-key"
+    );
+    assert_eq!(saw.body["model"], "gpt-5-mini-test");
+    let user_content = &saw.body["messages"][0]["content"];
+    assert_eq!(saw.body["messages"][0]["role"], "user");
+    assert!(
+        user_content
+            .as_str()
+            .unwrap_or("")
+            .contains("\u{ab}SECRET_GENERIC_001\u{bb}"),
+        "mock should have received the substituted prompt; got {user_content}"
+    );
+    Ok(())
+}
+
 // --- mock server scaffolding ---
 
 #[derive(Clone, Debug)]
 struct SeenRequest {
     api_key: Option<String>,
     anthropic_version: Option<String>,
+    body: Value,
+}
+
+#[derive(Clone, Debug)]
+struct SeenOpenAiRequest {
+    authorization: Option<String>,
     body: Value,
 }
 
@@ -246,6 +317,92 @@ async fn mock_handler(
         "usage": {
             "input_tokens": 11,
             "output_tokens": 7,
+        }
+    }))
+}
+
+#[derive(Clone)]
+struct MockOpenAiState {
+    response_text: String,
+    request_count: Arc<AtomicU64>,
+    last_seen: Arc<std::sync::Mutex<Option<SeenOpenAiRequest>>>,
+}
+
+struct MockOpenAi {
+    addr: SocketAddr,
+    request_count: Arc<AtomicU64>,
+    last_seen: Arc<std::sync::Mutex<Option<SeenOpenAiRequest>>>,
+}
+
+async fn spawn_openai_mock(response_text: &str) -> Result<MockOpenAi> {
+    let state = MockOpenAiState {
+        response_text: response_text.to_string(),
+        request_count: Arc::new(AtomicU64::new(0)),
+        last_seen: Arc::new(std::sync::Mutex::new(None)),
+    };
+    let request_count = state.request_count.clone();
+    let last_seen = state.last_seen.clone();
+
+    let app = Router::new()
+        .route("/v1/chat/completions", post(openai_mock_handler))
+        .with_state(state);
+
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    wait_for_listener(addr).await?;
+
+    Ok(MockOpenAi {
+        addr,
+        request_count,
+        last_seen,
+    })
+}
+
+async fn openai_mock_handler(
+    State(state): State<MockOpenAiState>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Json<Value> {
+    state.request_count.fetch_add(1, Ordering::Relaxed);
+
+    let authorization = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .map(String::from);
+
+    *state.last_seen.lock().unwrap() = Some(SeenOpenAiRequest {
+        authorization,
+        body,
+    });
+
+    // Canned chat.completion response. Includes `refusal: null` and
+    // `finish_reason` to match the real wire shape — the provider must
+    // tolerate the extra fields without breaking.
+    Json(json!({
+        "id": "chatcmpl-test",
+        "object": "chat.completion",
+        "created": 1_700_000_000,
+        "model": "gpt-5-mini-test",
+        "choices": [
+            {
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": state.response_text,
+                    "refusal": null,
+                },
+                "logprobs": null,
+                "finish_reason": "stop",
+            }
+        ],
+        "usage": {
+            "prompt_tokens": 13,
+            "completion_tokens": 9,
+            "total_tokens": 22,
         }
     }))
 }
