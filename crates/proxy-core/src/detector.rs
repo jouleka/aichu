@@ -11,6 +11,16 @@
 // The entropy gate is a precision filter for kinds with no distinctive
 // prefix (AWS_SECRET). For prefix-typed kinds the gate is `None` and
 // every regex match becomes a Finding.
+//
+// Exception: `GcpServiceAccountJson` does NOT go through the
+// regex-captures path. Its registered regex (still compiled, still
+// pinned by the prefilter invariant test for documentation) only
+// matches FLAT JSON. Nested-object derivatives (workload-identity
+// JSON with `"crypto": {...}`, federated configs with `"delegates":
+// [{...}]`) ship in the wild. To cover them without depending on
+// regex recursion (the `regex` crate has none), we marker-locate
+// `"type":"service_account"` and brace-walk outward to find the
+// enclosing envelope. See `gcp_service_account_envelopes`.
 
 use std::sync::OnceLock;
 
@@ -64,6 +74,21 @@ pub fn scan(input: &str) -> Vec<Finding> {
 
     let mut findings: Vec<Finding> = Vec::new();
     for (kind, re) in &c.regexes {
+        // GCP runs through the brace-counter pipeline rather than the
+        // regex `captures_iter`. The regex stays compiled (and pinned
+        // by the prefilter invariant test) but its `[^{}]*?` body
+        // can't match nested-object envelopes, so we ignore it here.
+        if *kind == SecretKind::GcpServiceAccountJson {
+            for (start, end) in gcp_service_account_envelopes(input) {
+                findings.push(Finding {
+                    kind: *kind,
+                    start,
+                    end,
+                    text: input[start..end].to_string(),
+                });
+            }
+            continue;
+        }
         let group_indices = kind.secret_capture_groups();
         let threshold = kind.min_entropy();
         for caps in re.captures_iter(input) {
@@ -123,6 +148,132 @@ pub fn scan(input: &str) -> Vec<Finding> {
         }
     }
     out
+}
+
+/// Maximum brace nesting depth the GCP envelope walker will track.
+/// Beyond this the walker bails (returning whatever envelopes have
+/// already been closed) rather than allocating unboundedly or
+/// looping on pathological input. Real service-account JSON nests
+/// at most one or two levels (`crypto`, `delegates`); 32 is several
+/// orders of magnitude past anything we expect from real tooling.
+const GCP_MAX_BRACE_DEPTH: usize = 32;
+/// `(start, end)` byte spans for every GCP service-account envelope
+/// in `input`. `end` is exclusive (slice with `input[start..end]`).
+///
+/// The walker is the production replacement for the legacy flat
+/// regex `\{[^{}]*?"type":"service_account"[^{}]*?\}`. It:
+///
+///   1. Locates each `"type":"service_account"` discriminator (with
+///      JSON-flexible whitespace around the colon) via a small
+///      marker regex.
+///   2. Runs a single forward pass over the input, tracking:
+///        - JSON string state (we ignore braces inside `"..."`,
+///          honoring `\"` escapes so an embedded literal quote
+///          doesn't prematurely close the string)
+///        - a stack of open `{` byte positions
+///        - per stack frame, whether a marker has been seen inside
+///          that scope yet
+///   3. When a `}` pops a frame whose marker-seen flag is set,
+///      records the `(open_pos, close_pos + 1)` envelope.
+///
+/// Returns envelopes in input order. Multiple non-overlapping
+/// envelopes can appear in one input (concatenated pasted records).
+///
+/// Adversarial-input policy:
+///   - Marker inside a string literal: ignored. WHY: a quoted
+///     mention of `"type":"service_account"` in documentation or
+///     error text isn't a real credential.
+///   - Unbalanced braces (open without matching close): no envelope
+///     emitted. WHY: fail-loud — we don't grab arbitrary text after
+///     an unclosed `{` and call it a secret.
+///   - Depth > `GCP_MAX_BRACE_DEPTH`: walker bails (warn + return
+///     what's already closed). WHY: protects against pathological
+///     adversarial input designed to exhaust memory.
+fn gcp_service_account_envelopes(input: &str) -> Vec<(usize, usize)> {
+    // Marker = the discriminator the legacy regex anchored on.
+    // Whitespace around the colon is tolerated (jq pretty-printers
+    // insert one space). The opening `"` of `"type"` is the
+    // marker's `start()` byte; checking string-state at that byte
+    // tells us whether the marker is a real top-level key or just
+    // a quoted mention.
+    static MARKER: OnceLock<Regex> = OnceLock::new();
+    let marker = MARKER.get_or_init(|| {
+        Regex::new(r#""type"\s*:\s*"service_account""#)
+            .expect("gcp marker regex builds")
+    });
+
+    let marker_starts: Vec<usize> = marker.find_iter(input).map(|m| m.start()).collect();
+    if marker_starts.is_empty() {
+        return Vec::new();
+    }
+    let marker_set: std::collections::HashSet<usize> = marker_starts.iter().copied().collect();
+
+    let bytes = input.as_bytes();
+    let mut stack: Vec<usize> = Vec::new();
+    let mut pending: Vec<bool> = Vec::new(); // parallel to stack: "marker seen in this scope?"
+    let mut envelopes: Vec<(usize, usize)> = Vec::new();
+    let mut in_string = false;
+    let mut escape_next = false;
+
+    for (i, &b) in bytes.iter().enumerate() {
+        // Record marker-presence BEFORE state transitions. At byte
+        // `i = marker.start()` we have not yet entered the
+        // following `"type"` string, so `in_string` reflects whether
+        // the marker as a whole sits inside an enclosing string.
+        if marker_set.contains(&i) && !in_string && !stack.is_empty() {
+            if let Some(last) = pending.last_mut() {
+                *last = true;
+            }
+        }
+
+        if in_string {
+            // Inside a JSON string. Honor backslash escapes so
+            // `\"` doesn't terminate the string and `\\` doesn't
+            // leave the next `"` as an escaped quote.
+            if escape_next {
+                escape_next = false;
+            } else if b == b'\\' {
+                escape_next = true;
+            } else if b == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+
+        match b {
+            b'"' => in_string = true,
+            b'{' => {
+                if stack.len() >= GCP_MAX_BRACE_DEPTH {
+                    // Bail. Already-emitted envelopes stay; pending
+                    // ones get dropped on the floor. The user sees
+                    // a Rule-12 warn rather than a silent hang.
+                    tracing::warn!(
+                        depth = stack.len(),
+                        "gcp envelope walker hit max brace depth; bailing",
+                    );
+                    return envelopes;
+                }
+                stack.push(i);
+                pending.push(false);
+            }
+            b'}' => {
+                if let Some(open) = stack.pop() {
+                    let had_marker = pending.pop().unwrap_or(false);
+                    if had_marker {
+                        envelopes.push((open, i + 1));
+                    }
+                }
+                // Unbalanced `}` (no matching `{`): ignored. Not
+                // our problem to validate JSON, only to avoid
+                // panicking.
+            }
+            _ => {}
+        }
+    }
+    // If the input ended mid-string or with unclosed braces, any
+    // markers in unclosed scopes are intentionally dropped: see the
+    // `gcp_does_not_match_unbalanced_braces` test for the WHY.
+    envelopes
 }
 
 /// Shannon entropy of a byte sequence, in bits per character.
@@ -620,6 +771,107 @@ BBBBB
             "multi-line indented GCP JSON must match: {f:?}",
         );
         assert_eq!(f[0].text, blob);
+    }
+
+    #[test]
+    fn gcp_detects_service_account_with_nested_crypto_block() {
+        // Realistic extended-format JSON: a nested `"crypto"` object
+        // alongside the standard top-level keys. The flat regex
+        // `\{[^{}]*?...\}` would refuse to cross the inner `{`/`}`
+        // and miss this case entirely. WHY this matters: workload-
+        // identity / federated-credential JSONs ship with nested
+        // crypto blocks in the wild; we must redact the WHOLE
+        // envelope so identifying metadata (client_email,
+        // project_id) doesn't leak with the inner blocks unredacted.
+        let blob = r#"{"type":"service_account","crypto":{"algo":"RS256","keysize":4096},"client_email":"sa@my-proj.iam.gserviceaccount.com","project_id":"my-proj"}"#;
+        let f = scan(blob);
+        assert_eq!(
+            kinds(&f),
+            vec![SecretKind::GcpServiceAccountJson],
+            "nested crypto block must not defeat detection; got {f:?}",
+        );
+        assert_eq!(
+            f[0].text, blob,
+            "the WHOLE envelope (including nested crypto object) is the secret",
+        );
+    }
+
+    #[test]
+    fn gcp_detects_service_account_with_nested_delegates_array_of_objects() {
+        // The other common nested shape: `"delegates"` array of
+        // objects. Same redaction-unit argument as the crypto-block
+        // test — the flat regex would stop at the first inner `}`
+        // and miss the envelope, so we'd silently leak the
+        // surrounding metadata.
+        let blob = r#"{"type":"service_account","delegates":[{"id":"a"},{"id":"b"}],"client_email":"sa@my-proj.iam.gserviceaccount.com"}"#;
+        let f = scan(blob);
+        assert_eq!(
+            kinds(&f),
+            vec![SecretKind::GcpServiceAccountJson],
+            "nested array-of-objects must not defeat detection; got {f:?}",
+        );
+        assert_eq!(f[0].text, blob);
+    }
+
+    #[test]
+    fn gcp_does_not_match_unbalanced_braces() {
+        // Adversarial input: a marker inside a `{` with no matching
+        // `}` to close it. The brace walker MUST return without
+        // matching (and must not hang, but a hang would manifest as
+        // a test timeout, not a wrong assertion). WHY: fail-loud on
+        // malformed JSON — emitting a finding that runs from the `{`
+        // to the end of the input would over-redact arbitrary text
+        // following a stray marker.
+        let s = r#"{"type":"service_account","project_id":"oops-no-close-brace"#;
+        let f = scan(s);
+        assert!(
+            !f.iter().any(|x| x.kind == SecretKind::GcpServiceAccountJson),
+            "unbalanced JSON must produce no GCP finding; got {f:?}",
+        );
+    }
+
+    #[test]
+    fn gcp_does_not_match_marker_inside_string_literal() {
+        // The marker character sequence (`"type":"service_account"`)
+        // appears INSIDE a quoted string value, escaped with `\"`.
+        // The actual JSON object has `"type":"other"`. A naive
+        // brace-walker that ignores string-quoting would see the
+        // marker, grab the surrounding `{...}`, and false-positive.
+        // WHY this matters: documentation, code snippets, and error
+        // messages routinely quote credential field names; treating
+        // a string mention of the marker as a real key would over-
+        // redact unrelated content.
+        let s = r#"{"description":"Use \"type\":\"service_account\" as the discriminator","type":"other"}"#;
+        let f = scan(s);
+        assert!(
+            !f.iter().any(|x| x.kind == SecretKind::GcpServiceAccountJson),
+            "marker inside string literal must not match; got {f:?}",
+        );
+    }
+
+    #[test]
+    fn gcp_detects_two_concatenated_service_accounts() {
+        // Two GCP blobs back-to-back in one input — exactly what a
+        // user pastes when dumping multiple `.env` records. Both
+        // must produce distinct findings (each will mint its own
+        // placeholder via PlaceholderMap dedup-by-text). WHY: the
+        // legacy flat regex DID handle this case (each blob is
+        // flat), and the brace-counter must remain a superset.
+        let blob_a = r#"{"type":"service_account","project_id":"proj-a","client_email":"a@a.iam"}"#;
+        let blob_b = r#"{"type":"service_account","project_id":"proj-b","client_email":"b@b.iam"}"#;
+        let s = format!("{blob_a}\n{blob_b}");
+        let f = scan(&s);
+        let gcp_findings: Vec<_> = f
+            .iter()
+            .filter(|x| x.kind == SecretKind::GcpServiceAccountJson)
+            .collect();
+        assert_eq!(
+            gcp_findings.len(),
+            2,
+            "two concatenated blobs must produce two findings; got {f:?}",
+        );
+        assert_eq!(gcp_findings[0].text, blob_a);
+        assert_eq!(gcp_findings[1].text, blob_b);
     }
 
     // ---- Twilio detection --------------------------------------------------

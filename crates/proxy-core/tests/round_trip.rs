@@ -168,6 +168,39 @@ fn round_trip_recovers_gcp_service_account_json_blob() {
 }
 
 #[test]
+fn gcp_round_trip_nested_object_form() {
+    // The brace-counter pipeline must round-trip a nested-object
+    // GCP envelope just as cleanly as the flat-JSON case. Pin the
+    // FULL contract: redact returns a single placeholder, reverse
+    // restores the entire envelope (nested crypto block + array of
+    // delegates + everything else) verbatim.
+    let blob = r#"{"type":"service_account","crypto":{"algo":"RS256","keysize":4096},"delegates":[{"id":"a"},{"id":"b"}],"client_email":"sa@my-proj.iam.gserviceaccount.com","private_key":"-----BEGIN PRIVATE KEY-----\nMIIE\n-----END PRIVATE KEY-----\n"}"#;
+    let prompt = format!("Deploy with: {blob}\nThen run.");
+    let mut map = PlaceholderMap::new();
+    let redacted = redact(&prompt, &mut map);
+    assert_eq!(map.len(), 1, "expected one placeholder for the nested GCP blob, got {}", map.len());
+    assert!(
+        redacted.contains("\u{ab}SECRET_GCP_SA_JSON_001\u{bb}"),
+        "missing GCP placeholder: {redacted:?}",
+    );
+    assert!(
+        !redacted.contains("-----BEGIN PRIVATE KEY-----"),
+        "inner PEM leaked through nested-form GCP envelope redaction: {redacted:?}",
+    );
+    assert!(
+        !redacted.contains("\"algo\":\"RS256\""),
+        "inner crypto block leaked through nested-form GCP envelope redaction: {redacted:?}",
+    );
+
+    let response = "Use \u{ab}SECRET_GCP_SA_JSON_001\u{bb} for deploys.";
+    let restored = reverse(response, &map);
+    assert!(
+        restored.contains(blob),
+        "round-trip dropped the nested GCP blob: {restored:?}",
+    );
+}
+
+#[test]
 fn round_trip_recovers_twilio_api_key_sid() {
     // Prefix-typed (`SK` + 32 hex) — whole match is the secret.
     // Pins that the TwilioAuthToken kind's two-arm regex restores
