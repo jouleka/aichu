@@ -737,6 +737,67 @@ async fn mitm_does_not_inject_on_non_prompt_endpoints() -> Result<()> {
     Ok(())
 }
 
+/// Same end-to-end injection contract as the OpenAI Chat test, but
+/// scoped to the Responses API wire shape. The injector sets the
+/// top-level `instructions` string field (NOT a `messages` entry —
+/// Responses doesn't have one). Pins the e03-measured guillemets
+/// preservation lift for Codex CLI and OpenCode users who route
+/// through this endpoint family.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mitm_injects_preserve_tokens_system_prompt_into_responses_request() -> Result<()> {
+    let upstream = spawn_capturing_upstream("/v1/responses").await?;
+    let ca_dir = TempDir::new()?;
+    let ca = load_or_create_ca(ca_dir.path())?;
+    let handler = AichuHandler::new();
+    let (proxy_addr, shutdown_tx) = spawn_proxy(ca.authority, handler).await?;
+
+    let client = reqwest::Client::builder()
+        .proxy(reqwest::Proxy::http(format!("http://{proxy_addr}"))?)
+        .timeout(Duration::from_secs(5))
+        .build()?;
+
+    let _ = client
+        .post(format!("http://{}/v1/responses", upstream.addr))
+        .header("authorization", "Bearer fake-test-key")
+        .json(&json!({
+            "model": "gpt-5-mini",
+            "input": "Debug AKIAIOSFODNN7EXAMPLE on S3.",
+        }))
+        .send()
+        .await?;
+
+    let captured = upstream.last_body.lock().unwrap().clone().expect("body");
+    let parsed: Value = serde_json::from_str(std::str::from_utf8(&captured)?)?;
+
+    // Top-level `instructions` carries our prompt. Per the OpenAI
+    // SDK `ResponseCreateParamsBase.instructions` is `string | null`,
+    // so the value must be a string — an array form here would
+    // signal a regression where someone mirrored the Anthropic
+    // array-branch into the Responses injector by mistake.
+    let instructions = parsed["instructions"]
+        .as_str()
+        .expect("instructions should be a string");
+    assert!(
+        instructions.starts_with(proxy_core::PRESERVE_TOKENS_PROMPT),
+        "injected prompt must be the FIRST content in `instructions`; got: {instructions}",
+    );
+
+    // `input` must survive byte-for-byte minus redaction; the
+    // injector touches `instructions` only.
+    let user_input = parsed["input"].as_str().expect("input is a string");
+    assert!(
+        user_input.contains("\u{ab}SECRET_AWS_KEY_001\u{bb}"),
+        "user input must carry the redaction placeholder: {user_input}",
+    );
+    assert!(
+        !user_input.contains("AKIAIOSFODNN7EXAMPLE"),
+        "raw secret must not reach upstream: {user_input}",
+    );
+
+    let _ = shutdown_tx.send(());
+    Ok(())
+}
+
 async fn collect_h2_body(mut body: h2::RecvStream) -> Result<String> {
     let mut buf = Vec::new();
     while let Some(chunk) = body.data().await {

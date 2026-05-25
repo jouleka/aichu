@@ -454,6 +454,59 @@ async fn relay_injects_preserve_tokens_system_prompt_into_openai_chat_request() 
     Ok(())
 }
 
+/// Mode A counterpart for the OpenAI Responses API. The relay must
+/// (1) route `/v1/responses` to the OpenAI upstream, (2) redact
+/// secret-shaped substrings out of the body, and (3) prepend
+/// `PRESERVE_TOKENS_PROMPT` into the top-level `instructions`
+/// string (the canonical Responses-API system-message slot per the
+/// OpenAI Node SDK `ResponseCreateParamsBase`).
+///
+/// Why both routing AND injection are pinned here: without the
+/// route, the new `InjectionShape::OpenAiResponses` variant would
+/// be dead code in Mode A — Codex CLI users on the localhost
+/// relay would silently get no preserve-tokens lift.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn relay_injects_preserve_tokens_system_prompt_into_responses_request() -> Result<()> {
+    let upstream = spawn_capturing_upstream("/v1/responses").await?;
+    let config = RelayConfig {
+        anthropic_upstream: "http://127.0.0.1:1".to_string(),
+        openai_upstream: format!("http://{}", upstream.addr),
+        inject_system_prompt: true,
+    };
+    let (relay_addr, shutdown_tx) = spawn_relay(config).await?;
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()?;
+    let _ = client
+        .post(format!("http://{relay_addr}/v1/responses"))
+        .header("authorization", "Bearer fake-test-key")
+        .json(&json!({
+            "model": "gpt-5-mini",
+            "input": "Debug AKIAIOSFODNN7EXAMPLE on S3.",
+        }))
+        .send()
+        .await?;
+
+    let captured = upstream.last_body.lock().unwrap().clone().expect("body");
+    let parsed: Value = serde_json::from_str(std::str::from_utf8(&captured)?)?;
+
+    // Top-level `instructions` carries our prompt as a string.
+    let instructions = parsed["instructions"].as_str().expect("instructions is string");
+    assert!(
+        instructions.starts_with(proxy_core::PRESERVE_TOKENS_PROMPT),
+        "preserve-tokens prompt must be at the front of `instructions`; got: {instructions}",
+    );
+
+    // Redaction still ran ahead of injection — pair pins ordering.
+    let user_input = parsed["input"].as_str().expect("input is string");
+    assert!(user_input.contains("\u{ab}SECRET_AWS_KEY_001\u{bb}"));
+    assert!(!user_input.contains("AKIAIOSFODNN7EXAMPLE"));
+
+    let _ = shutdown_tx.send(());
+    Ok(())
+}
+
 /// Pins the `--no-system-prompt` opt-out for Mode A. With injection
 /// off, the forwarded body must NOT contain our preserve-tokens
 /// text — redaction still runs. Mirrors the Mode B

@@ -40,7 +40,7 @@ use axum::{
 };
 use bytes::Bytes;
 use futures_util::stream::{self, Stream, StreamExt};
-use proxy_core::{PlaceholderMap, SseReverser};
+use proxy_core::{InjectionShape, PlaceholderMap, SseReverser};
 use reqwest::Client;
 
 use crate::RelayConfig;
@@ -61,6 +61,12 @@ pub fn router(config: RelayConfig) -> Router {
     Router::new()
         .route("/v1/messages", post(handle_anthropic_messages))
         .route("/v1/chat/completions", post(handle_openai_chat))
+        // Responses-API endpoint (forwarded to the OpenAI upstream).
+        // Codex CLI and OpenCode both speak this shape; without a
+        // route here, Mode A users on those tools would silently get
+        // no preserve-tokens injection. The wire shape is
+        // documented in `proxy_core::system_prompt::inject_responses`.
+        .route("/v1/responses", post(handle_openai_responses))
         .with_state(state)
 }
 
@@ -88,17 +94,16 @@ async fn handle_openai_chat(
     forward(state.http, url, req, inject).await
 }
 
-/// Wire shape the system-prompt injector can safely mutate. Mirrors
-/// the proxy-mitm crate's `InjectionShape`. We keep two copies (one
-/// here, one in proxy-mitm) rather than re-exporting from proxy-core
-/// because the routing decision is made by the dispatcher (axum
-/// router vs hudsucker handler), not by proxy-core — and the two
-/// dispatchers reach the request differently. The variants must
-/// stay in sync; if more shapes land, factor into proxy-core.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum InjectionShape {
-    Anthropic,
-    OpenAiChat,
+async fn handle_openai_responses(
+    State(state): State<AppState>,
+    req: Request,
+) -> Response<Body> {
+    let url = format!("{}/v1/responses", state.config.openai_upstream);
+    let inject = state
+        .config
+        .inject_system_prompt
+        .then_some(InjectionShape::OpenAiResponses);
+    forward(state.http, url, req, inject).await
 }
 
 /// Forward `req` to `url` over reqwest. Hop-by-hop headers are stripped
@@ -394,10 +399,7 @@ fn inject_after_redact(body_str: &str, shape: Option<InjectionShape>) -> String 
             return body_str.to_string();
         }
     };
-    match shape {
-        InjectionShape::Anthropic => proxy_core::inject_anthropic(&mut value),
-        InjectionShape::OpenAiChat => proxy_core::inject_openai(&mut value),
-    }
+    shape.inject(&mut value);
     // Compact serialization — the wire does not require pretty-
     // printed bytes, and keeping output compact matches the
     // pre-injection size profile (we only added one field/element).

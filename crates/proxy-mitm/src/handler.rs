@@ -58,7 +58,7 @@ use hudsucker::{
         header::{ACCEPT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE},
     },
 };
-use proxy_core::{PlaceholderMap, SseReverser};
+use proxy_core::{InjectionShape, PlaceholderMap, SseReverser};
 
 #[derive(Clone)]
 pub struct AichuHandler {
@@ -136,38 +136,39 @@ fn is_prompt_endpoint(path: &str) -> bool {
     )
 }
 
-/// Wire shape the system-prompt injector can safely mutate for a
-/// given path. Distinct from the redaction allow-list above — the
-/// `Responses`-family endpoints (`/v1/responses`, `/backend-api/codex/responses`,
-/// `/zen/v1/responses`) accept prompts but use a different wire
-/// shape (`input` instead of `messages`) that `proxy_core::system_prompt`
-/// does not handle in v0. Returning `None` for those keeps redaction
-/// running while skipping injection — we never silently mutate a
-/// body shape we don't model.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum InjectionShape {
-    /// Anthropic `/v1/messages` — `system` is a top-level body field.
-    Anthropic,
-    /// OpenAI `/v1/chat/completions` (and the OpenCode zen alias) —
-    /// system goes as the first element of `messages` with
-    /// `role: "system"`.
-    OpenAiChat,
-}
-
+/// Map a prompt-endpoint path to the wire-shape variant of
+/// `proxy_core::InjectionShape` that can safely mutate it. Distinct
+/// from the redaction allow-list above — both the Chat-Completions
+/// and Responses families of endpoints are recognized here so the
+/// injector can prepend `PRESERVE_TOKENS_PROMPT` to whichever
+/// system-level field the wire shape exposes (`messages[0]` for
+/// Chat, top-level `instructions` for Responses, top-level `system`
+/// for Anthropic).
+///
+/// `None` is reserved for paths that pass redaction's allow-list
+/// but have no known injection shape — there are none today, but
+/// keeping the `Option` return shape avoids forcing every new prompt
+/// endpoint to have an injection variant on day one. (If a future
+/// endpoint joins `is_prompt_endpoint` without a matching shape,
+/// the injector short-circuits at the `None` arm in
+/// `inject_after_redact` and the redact-then-forward path still
+/// runs.)
 fn injection_shape_for(path: &str) -> Option<InjectionShape> {
     match path {
         "/v1/messages" => Some(InjectionShape::Anthropic),
         "/v1/chat/completions" | "/zen/v1/chat/completions" => Some(InjectionShape::OpenAiChat),
+        "/v1/responses" | "/backend-api/codex/responses" | "/zen/v1/responses" => {
+            Some(InjectionShape::OpenAiResponses)
+        }
         _ => None,
     }
 }
 
 /// Parse `body_str` as JSON, dispatch to the shape-matching
-/// `proxy_core::system_prompt` injector, and re-serialize. Returns
+/// `proxy_core::InjectionShape::inject`, and re-serialize. Returns
 /// the original `body_str` unchanged when:
-///   - `shape` is `None` (the path is a known prompt endpoint but
-///     not one of the wire shapes we know how to mutate — e.g. the
-///     Responses-family endpoints), or
+///   - `shape` is `None` (path has no known injection shape — see
+///     `injection_shape_for`), or
 ///   - the body is not valid JSON (we fail loud: log at warn and
 ///     forward unmodified rather than rewriting a body we can't
 ///     parse — per CLAUDE.md Rule 12).
@@ -191,10 +192,7 @@ fn inject_after_redact(body_str: &str, shape: Option<InjectionShape>) -> String 
             return body_str.to_string();
         }
     };
-    match shape {
-        InjectionShape::Anthropic => proxy_core::inject_anthropic(&mut value),
-        InjectionShape::OpenAiChat => proxy_core::inject_openai(&mut value),
-    }
+    shape.inject(&mut value);
     // serde_json::to_string emits compact JSON. The wire never
     // requires the upstream to see pretty-printed bytes, and compact
     // serialization keeps the redacted size invariant we relied on
@@ -483,3 +481,64 @@ where
     )
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn injection_shape_for_recognizes_every_known_prompt_endpoint() {
+        // Why this exists: the path → shape mapping lives in this
+        // crate (not proxy-core) and is the only place that
+        // decides whether Codex CLI's `/backend-api/codex/responses`
+        // and OpenCode's `/zen/v1/responses` get preserve-tokens
+        // injection. A regression where someone removed one of
+        // those arms — or added a new prompt endpoint to
+        // `is_prompt_endpoint` without wiring its shape here —
+        // would silently degrade those tools' placeholder
+        // preservation from the e03-measured 96% back to 12%
+        // without any test failure on the headline Anthropic /
+        // OpenAI Chat paths.
+        assert_eq!(
+            injection_shape_for("/v1/messages"),
+            Some(InjectionShape::Anthropic),
+        );
+        assert_eq!(
+            injection_shape_for("/v1/chat/completions"),
+            Some(InjectionShape::OpenAiChat),
+        );
+        assert_eq!(
+            injection_shape_for("/zen/v1/chat/completions"),
+            Some(InjectionShape::OpenAiChat),
+        );
+        assert_eq!(
+            injection_shape_for("/v1/responses"),
+            Some(InjectionShape::OpenAiResponses),
+            "Responses-API path must inject — Codex CLI users depend on this",
+        );
+        assert_eq!(
+            injection_shape_for("/backend-api/codex/responses"),
+            Some(InjectionShape::OpenAiResponses),
+            "Codex CLI's ChatGPT-backend path must inject",
+        );
+        assert_eq!(
+            injection_shape_for("/zen/v1/responses"),
+            Some(InjectionShape::OpenAiResponses),
+            "OpenCode's zen Responses path must inject",
+        );
+    }
+
+    #[test]
+    fn injection_shape_for_returns_none_on_non_prompt_paths() {
+        // Symmetric guard: paths outside the prompt-endpoint set
+        // (OAuth token endpoints, model metadata, anything else)
+        // must NOT match a shape. A regression where someone added
+        // a catch-all arm would graft a `system` field onto every
+        // outbound body — breaking OAuth flows in exactly the way
+        // `mitm_does_not_inject_on_non_prompt_endpoints` is meant
+        // to catch end-to-end. This test catches it at the unit
+        // level so the failure points directly at the mapping.
+        assert_eq!(injection_shape_for("/v1/oauth/token"), None);
+        assert_eq!(injection_shape_for("/v1/models"), None);
+        assert_eq!(injection_shape_for("/"), None);
+    }
+}

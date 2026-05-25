@@ -243,6 +243,15 @@ suspect exposure.
   covered. The architecture scales (one new variant + regex +
   dedicated detection tests per pattern); coverage expansion is a
   future-work axis, not a v0 ship-blocker.
+- **OpenCode `/zen/v1/responses` body shape unvalidated.** The proxy
+  treats this path as the canonical OpenAI Responses-API shape and
+  injects the preserve-tokens prompt into a top-level `instructions`
+  field. If OpenCode's zen layer wraps or transforms the body before
+  it reaches the OpenAI upstream, our injection may land in a slot
+  zen doesn't pass through. The injector is fail-loud (warn + forward
+  unchanged on shape mismatch), so the worst case is degraded UX
+  (no preservation lift) rather than a corrupted body. A smoke-test
+  against a real OpenCode capture would close the loop.
 - **Cross-family eval still partial.** First measured run lives at
   [`experiments/e03-placeholder-eval/results/gpt-5-mini-2026-05-25.json`](experiments/e03-placeholder-eval/results/gpt-5-mini-2026-05-25.json)
   (300 calls × gpt-5-mini, summarized under "Model paraphrase" above).
