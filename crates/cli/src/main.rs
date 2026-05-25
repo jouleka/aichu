@@ -38,7 +38,11 @@ struct Cli {
 #[derive(Subcommand, Debug, Clone)]
 enum Commands {
     /// Start the proxy on 127.0.0.1:8788 (default if no subcommand given).
-    Run,
+    /// `--no-system-prompt` disables the preserve-tokens system prompt
+    /// the proxy normally injects into forwarded prompt-endpoint
+    /// bodies (default ON; the e03 eval measured it lifts secret-
+    /// placeholder echo accuracy from 12% to 96% on gpt-5-mini).
+    Run(RunArgs),
     /// Install the local CA into the OS trust store (macOS System keychain
     /// or Linux: Debian/Red Hat/Arch families; requires sudo).
     Trust,
@@ -49,12 +53,31 @@ enum Commands {
     Doctor,
 }
 
+/// Arguments to `aichu run`. Kept as its own struct so clap can
+/// surface defaults and the long-form help nicely, and so the unit
+/// test that pins flag parsing can construct the args directly.
+#[derive(clap::Args, Debug, Clone)]
+struct RunArgs {
+    /// Disable the preserve-tokens system prompt the proxy normally
+    /// prepends to forwarded prompt-endpoint requests. The prompt
+    /// tells the model to echo `«SECRET_TYPE_NNN»` placeholders
+    /// verbatim so the response-side reverse pass can restore the
+    /// original secrets — disabling it brings back the model-
+    /// dependent behavior the e03 eval measured at as low as 12%
+    /// preservation on gpt-5-mini.
+    #[arg(long, default_value_t = false)]
+    no_system_prompt: bool,
+}
+
 impl Cli {
-    /// Resolve the user-issued subcommand, defaulting to `Run` when none
-    /// was given. Centralizing the default here means tests can assert
-    /// the defaulting policy without re-parsing argv shapes.
+    /// Resolve the user-issued subcommand, defaulting to `Run` (with
+    /// default `RunArgs`) when none was given. Centralizing the default
+    /// here means tests can assert the defaulting policy without
+    /// re-parsing argv shapes.
     fn command(&self) -> Commands {
-        self.command.clone().unwrap_or(Commands::Run)
+        self.command
+            .clone()
+            .unwrap_or(Commands::Run(RunArgs { no_system_prompt: false }))
     }
 }
 
@@ -63,7 +86,7 @@ async fn main() -> Result<()> {
     init_tracing();
     let cli = Cli::parse();
     match cli.command() {
-        Commands::Run => run().await,
+        Commands::Run(args) => run(args).await,
         Commands::Trust => handle_trust(),
         Commands::Untrust => handle_untrust(),
         Commands::Doctor => handle_doctor(),
@@ -86,7 +109,7 @@ fn init_tracing() {
 /// The bind address and CA path are intentionally hardcoded for v0.
 /// They will become flags only when there is observed user demand —
 /// premature flags become permanent surface area.
-async fn run() -> Result<()> {
+async fn run(args: RunArgs) -> Result<()> {
     let ca_dir = ca_dir()?;
 
     // `load_or_create_ca` is responsible for creating `ca_dir` on first
@@ -99,7 +122,18 @@ async fn run() -> Result<()> {
     );
 
     let addr: SocketAddr = "127.0.0.1:8788".parse().expect("hardcoded addr parses");
-    let handler = proxy_mitm::handler::AichuHandler::new();
+    // `--no-system-prompt` flips the default-ON injection off. The
+    // negation is at the flag layer (clap), not here — `args.no_system_prompt`
+    // arrives as the user's literal intent, and we invert it once
+    // when constructing the handler.
+    let inject_system_prompt = !args.no_system_prompt;
+    let handler = proxy_mitm::handler::AichuHandler::new()
+        .with_inject_system_prompt(inject_system_prompt);
+    if !inject_system_prompt {
+        tracing::info!(
+            "preserve-tokens system prompt injection disabled (--no-system-prompt)",
+        );
+    }
 
     tracing::info!(%addr, "proxy listening — Ctrl-C to stop");
     proxy_mitm::run_proxy(addr, ca.authority, handler, async {
@@ -881,13 +915,58 @@ mod tests {
     #[test]
     fn no_subcommand_defaults_to_run() {
         let cli = Cli::parse_from(["aichu"]);
-        assert!(matches!(cli.command(), Commands::Run));
+        match cli.command() {
+            // Default to Run with default args (injection ON — the
+            // default-OFF behavior is what the dedicated flag test
+            // pins). Bare `aichu` MUST land here; if a future
+            // refactor changes the default, the user-facing entry
+            // point silently changes too.
+            Commands::Run(args) => assert!(
+                !args.no_system_prompt,
+                "default Run should keep system-prompt injection ON",
+            ),
+            other => panic!("expected Commands::Run, got {other:?}"),
+        }
     }
 
     #[test]
     fn explicit_run_subcommand_resolves_to_run() {
         let cli = Cli::parse_from(["aichu", "run"]);
-        assert!(matches!(cli.command(), Commands::Run));
+        match cli.command() {
+            Commands::Run(args) => assert!(!args.no_system_prompt),
+            other => panic!("expected Commands::Run, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn run_with_no_system_prompt_flag_sets_field_true() {
+        // Pin: `aichu run --no-system-prompt` flips the field. Without
+        // this test, a regression that renamed/dropped the flag (or
+        // mis-wired the inversion in `run()`) would silently leave
+        // injection ON for users who explicitly opted out — exactly
+        // the kind of "fail silently" failure CLAUDE.md Rule 12
+        // exists to prevent.
+        let cli = Cli::parse_from(["aichu", "run", "--no-system-prompt"]);
+        match cli.command() {
+            Commands::Run(args) => assert!(
+                args.no_system_prompt,
+                "--no-system-prompt should set no_system_prompt to true",
+            ),
+            other => panic!("expected Commands::Run, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn run_default_keeps_system_prompt_on() {
+        // Pin the default-ON contract explicitly: `aichu run` with
+        // no flags must NOT set `no_system_prompt`. Belt-and-
+        // suspenders for the e03 result — users who don't pass the
+        // flag get the e03-measured behavior by default.
+        let cli = Cli::parse_from(["aichu", "run"]);
+        match cli.command() {
+            Commands::Run(args) => assert!(!args.no_system_prompt),
+            other => panic!("expected Commands::Run, got {other:?}"),
+        }
     }
 
     #[test]

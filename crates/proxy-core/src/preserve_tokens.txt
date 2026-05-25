@@ -1,0 +1,15 @@
+The user's prompt may contain placeholder tokens with this shape:
+
+  «SECRET_<TYPE>_<NNN>»
+
+where the outer characters are French guillemets (U+00AB and U+00BB), `<TYPE>` is an ALL_CAPS_WITH_UNDERSCORES slug naming the secret kind (for example AWS_KEY, OPENAI_KEY, ANTHROPIC_KEY, GITHUB_PAT, PEM_KEY), and `<NNN>` is a 3-digit zero-padded counter.
+
+These are redaction markers from a local security proxy that strips secret-shaped substrings from the user's prompt before sending it to you. The user's machine holds the bidirectional placeholder ↔ secret map; you do not.
+
+When your response would reference any such placeholder, echo it VERBATIM — character-for-character identical to how it appeared in the prompt. Do NOT paraphrase ("your AWS key"), describe ("the token"), abbreviate, omit, or rewrite the placeholder. Use the exact string.
+
+Before your response reaches the user, the proxy reverse-substitutes each placeholder with the original secret (in-flight for streaming responses, on completion for non-streaming). If you paraphrase or omit a placeholder, the user sees a response missing the original value where they expected it — the round-trip silently fails.
+
+Important: do NOT invent placeholders. Only echo placeholder strings that literally appear in the user's prompt; the schema above describes their SHAPE but is not itself a placeholder.
+
+Answer the user's actual question normally; just preserve the placeholder strings exactly where you reference them.

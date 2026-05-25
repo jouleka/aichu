@@ -367,7 +367,17 @@ async fn mitm_isolates_concurrent_h2_streams_on_one_connection() -> Result<()> {
     let upstream = spawn_echoing_upstream("/v1/messages").await?;
     let ca_dir = TempDir::new()?;
     let ca = load_or_create_ca(ca_dir.path())?;
-    let handler = AichuHandler::new();
+    // System-prompt injection OFF for this test: the echoing upstream
+    // replays the (post-injection) request body in its response, so
+    // the schema text `«SECRET_<TYPE>_<NNN>»` inside the injected
+    // preserve-tokens prompt would round-trip back into the client's
+    // response body and trip the "no placeholder string leaked" check
+    // below. That check is genuine and load-bearing — it pins the
+    // HTTP/2 multiplex cross-contamination invariant — but the echo
+    // upstream is an artifact of the test, not how real upstreams
+    // behave. Disabling injection here keeps the test focused on the
+    // H2-keying invariant it was built for.
+    let handler = AichuHandler::new().with_inject_system_prompt(false);
     let (proxy_addr, shutdown_tx) = spawn_proxy(ca.authority, handler).await?;
 
     // Distinct AWS keys so each map slot mints `«SECRET_AWS_KEY_001»`
@@ -494,6 +504,233 @@ async fn mitm_isolates_concurrent_h2_streams_on_one_connection() -> Result<()> {
     assert!(
         !body_b_recv.contains("\u{ab}SECRET_"),
         "placeholder leaked into response B: {body_b_recv}"
+    );
+
+    let _ = shutdown_tx.send(());
+    Ok(())
+}
+
+/// The proxy injects `proxy_core::PRESERVE_TOKENS_PROMPT` into the
+/// forwarded body for known Anthropic prompt endpoints. The upstream
+/// must observe both: (1) the redaction (placeholder substituted
+/// for the secret), and (2) the prompt prepended to `system`.
+///
+/// Why this matters end-to-end: the e03 eval measured that adding
+/// this prompt lifts guillemets preservation from 12% to 96% on
+/// gpt-5-mini. The whole point of wiring it in is that EVERY
+/// forwarded prompt request carries it; if a future refactor moves
+/// injection behind a feature gate or drops it on Anthropic, this
+/// test catches that the user-visible secret-restoration accuracy
+/// regression.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mitm_injects_preserve_tokens_system_prompt_into_anthropic_request() -> Result<()> {
+    let upstream = spawn_capturing_upstream("/v1/messages").await?;
+    let ca_dir = TempDir::new()?;
+    let ca = load_or_create_ca(ca_dir.path())?;
+    let handler = AichuHandler::new();
+    let (proxy_addr, shutdown_tx) = spawn_proxy(ca.authority, handler).await?;
+
+    let client = reqwest::Client::builder()
+        .proxy(reqwest::Proxy::http(format!("http://{proxy_addr}"))?)
+        .timeout(Duration::from_secs(5))
+        .build()?;
+
+    let _ = client
+        .post(format!("http://{}/v1/messages", upstream.addr))
+        .header("x-api-key", "fake-test-key")
+        .json(&json!({
+            "model": "claude-opus-4-5",
+            "max_tokens": 100,
+            "messages": [{
+                "role": "user",
+                "content": "Debug AKIAIOSFODNN7EXAMPLE on S3.",
+            }],
+        }))
+        .send()
+        .await?;
+
+    let captured = upstream.last_body.lock().unwrap().clone().expect("body");
+    let captured_str = std::str::from_utf8(&captured)?;
+    let parsed: Value = serde_json::from_str(captured_str)?;
+
+    // Redaction still happens. If a future refactor sequenced
+    // injection before redaction, the prompt's own example text
+    // would be detected and stripped — the assertion below would
+    // hold but `placeholders = 1` in the log would not. The pair
+    // pins the ordering: redact, THEN inject.
+    let system_text = parsed["system"].as_str().expect("system should be a string");
+    assert!(
+        system_text.starts_with(proxy_core::PRESERVE_TOKENS_PROMPT),
+        "injected prompt must be the FIRST content in `system`; got: {system_text}"
+    );
+
+    // Body still carries the redacted user content alongside the
+    // injected prompt — confirms the original message survived
+    // injection.
+    let user_content = parsed["messages"][0]["content"]
+        .as_str()
+        .expect("user message content should still be a string");
+    assert!(
+        user_content.contains("\u{ab}SECRET_AWS_KEY_001\u{bb}"),
+        "user message must still contain the redaction placeholder: {user_content}"
+    );
+    assert!(
+        !user_content.contains("AKIAIOSFODNN7EXAMPLE"),
+        "raw secret must not survive in user content: {user_content}"
+    );
+
+    let _ = shutdown_tx.send(());
+    Ok(())
+}
+
+/// Same end-to-end injection contract, scoped to the OpenAI Chat
+/// Completions wire shape. The injector puts our preserve-tokens
+/// prompt as a new system message at index 0 (since the test request
+/// has no client-supplied system message).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mitm_injects_preserve_tokens_system_prompt_into_openai_chat_request() -> Result<()> {
+    let upstream = spawn_capturing_upstream("/v1/chat/completions").await?;
+    let ca_dir = TempDir::new()?;
+    let ca = load_or_create_ca(ca_dir.path())?;
+    let handler = AichuHandler::new();
+    let (proxy_addr, shutdown_tx) = spawn_proxy(ca.authority, handler).await?;
+
+    let client = reqwest::Client::builder()
+        .proxy(reqwest::Proxy::http(format!("http://{proxy_addr}"))?)
+        .timeout(Duration::from_secs(5))
+        .build()?;
+
+    let _ = client
+        .post(format!("http://{}/v1/chat/completions", upstream.addr))
+        .header("authorization", "Bearer fake-test-key")
+        .json(&json!({
+            "model": "gpt-5-mini",
+            "messages": [{
+                "role": "user",
+                "content": "Debug AKIAIOSFODNN7EXAMPLE on S3.",
+            }],
+        }))
+        .send()
+        .await?;
+
+    let captured = upstream.last_body.lock().unwrap().clone().expect("body");
+    let parsed: Value = serde_json::from_str(std::str::from_utf8(&captured)?)?;
+    let messages = parsed["messages"].as_array().expect("messages is an array");
+
+    // Index 0: our injected system message. Position matters —
+    // OpenAI's documented behavior gives the FIRST system message
+    // precedence, so we must be at the front, not appended.
+    assert_eq!(messages[0]["role"], "system");
+    assert_eq!(messages[0]["content"], proxy_core::PRESERVE_TOKENS_PROMPT);
+
+    // Index 1: the redacted user message. Both that the original
+    // message survived AND that redaction happened before injection.
+    assert_eq!(messages[1]["role"], "user");
+    let user_content = messages[1]["content"].as_str().expect("user content is a string");
+    assert!(
+        user_content.contains("\u{ab}SECRET_AWS_KEY_001\u{bb}"),
+        "user content must carry the redaction placeholder: {user_content}"
+    );
+    assert!(
+        !user_content.contains("AKIAIOSFODNN7EXAMPLE"),
+        "raw secret must not reach upstream: {user_content}"
+    );
+
+    let _ = shutdown_tx.send(());
+    Ok(())
+}
+
+/// Pins the `--no-system-prompt` opt-out: when the CLI passes
+/// `inject_system_prompt: false` through to the handler, the
+/// forwarded body must NOT carry the preserve-tokens prompt. Without
+/// this test, a regression that ignored the flag and always
+/// injected would be invisible to anyone who never uses the flag.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mitm_does_not_inject_when_disabled() -> Result<()> {
+    let upstream = spawn_capturing_upstream("/v1/messages").await?;
+    let ca_dir = TempDir::new()?;
+    let ca = load_or_create_ca(ca_dir.path())?;
+    let handler = AichuHandler::new().with_inject_system_prompt(false);
+    let (proxy_addr, shutdown_tx) = spawn_proxy(ca.authority, handler).await?;
+
+    let client = reqwest::Client::builder()
+        .proxy(reqwest::Proxy::http(format!("http://{proxy_addr}"))?)
+        .timeout(Duration::from_secs(5))
+        .build()?;
+
+    let _ = client
+        .post(format!("http://{}/v1/messages", upstream.addr))
+        .header("x-api-key", "fake-test-key")
+        .json(&json!({
+            "model": "claude-opus-4-5",
+            "max_tokens": 100,
+            "messages": [{"role": "user", "content": "AKIAIOSFODNN7EXAMPLE"}],
+        }))
+        .send()
+        .await?;
+
+    let captured = upstream.last_body.lock().unwrap().clone().expect("body");
+    let captured_str = std::str::from_utf8(&captured)?;
+    let parsed: Value = serde_json::from_str(captured_str)?;
+    // No `system` field added — neither as string nor as array. The
+    // exact `is_null()` check is what the no-injection branch
+    // promises (we never set `system` when it was absent and
+    // injection is off).
+    assert!(
+        parsed.get("system").is_none(),
+        "system field must be absent when injection is disabled; got: {captured_str}"
+    );
+    // Redaction must STILL happen — the opt-out is for the prompt,
+    // not for the privacy guarantee.
+    assert!(
+        captured_str.contains("\u{ab}SECRET_AWS_KEY_001\u{bb}"),
+        "redaction must still run when injection is off: {captured_str}"
+    );
+
+    let _ = shutdown_tx.send(());
+    Ok(())
+}
+
+/// Pins that the injector RESPECTS the redaction allow-list — a
+/// non-prompt endpoint (OAuth refresh, model metadata, etc.) must
+/// NOT have a system prompt grafted into its body. Without this,
+/// every non-prompt body the proxy sees would get a `system` field
+/// added to it, breaking auth flows in exactly the same way the
+/// non-prompt redaction skip was designed to prevent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mitm_does_not_inject_on_non_prompt_endpoints() -> Result<()> {
+    let upstream = spawn_capturing_upstream("/v1/oauth/token").await?;
+    let ca_dir = TempDir::new()?;
+    let ca = load_or_create_ca(ca_dir.path())?;
+    let handler = AichuHandler::new(); // default ON
+    let (proxy_addr, shutdown_tx) = spawn_proxy(ca.authority, handler).await?;
+
+    let client = reqwest::Client::builder()
+        .proxy(reqwest::Proxy::http(format!("http://{proxy_addr}"))?)
+        .timeout(Duration::from_secs(5))
+        .build()?;
+
+    let _ = client
+        .post(format!("http://{}/v1/oauth/token", upstream.addr))
+        .json(&json!({
+            "grant_type": "refresh_token",
+            "refresh_token": "sk-proj-fake-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        }))
+        .send()
+        .await?;
+
+    let captured = upstream.last_body.lock().unwrap().clone().expect("body");
+    let captured_str = std::str::from_utf8(&captured)?;
+    assert!(
+        !captured_str.contains(proxy_core::PRESERVE_TOKENS_PROMPT),
+        "non-prompt endpoint body was mutated by the injector — \
+         would break OAuth and metadata flows: {captured_str}"
+    );
+    // The original body must still flow through untouched (same
+    // contract as `mitm_does_not_redact_non_prompt_paths`).
+    assert!(
+        captured_str.contains("refresh_token"),
+        "non-prompt body should reach upstream unchanged: {captured_str}"
     );
 
     let _ = shutdown_tx.send(());

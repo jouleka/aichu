@@ -58,6 +58,29 @@ pub fn reverse(text: &str, map: &PlaceholderMap) -> String {
 mod tests {
     use super::*;
     use crate::rules::SecretKind;
+    use crate::system_prompt::PRESERVE_TOKENS_PROMPT;
+
+    /// Defensive: the production system prompt the proxy injects on
+    /// outbound requests describes the placeholder SHAPE using
+    /// `«SECRET_<TYPE>_<NNN>»` (literal `<` and `>`), specifically to
+    /// stay OUT of this regex's character class. If anyone ever
+    /// relaxes the regex to accept `<` or `>` (or some future
+    /// refactor changes the schema text), the prompt's own text
+    /// becomes regex-matchable AND will be reverse-substituted with
+    /// whatever real secret happens to share its placeholder id —
+    /// silently leaking that secret to every echoing assistant
+    /// response. Pin the no-match invariant here so the next person
+    /// who touches either side is forced to think about it.
+    #[test]
+    fn placeholder_regex_does_not_match_system_prompt_schema_text() {
+        let re = placeholder_re();
+        assert!(
+            !re.is_match(PRESERVE_TOKENS_PROMPT),
+            "production system prompt must NOT contain anything matching \
+             the placeholder regex; otherwise the reverse pass will \
+             splice user secrets into the model's instruction text"
+        );
+    }
 
     fn make_map_with_one_secret(kind: SecretKind, secret: &str) -> PlaceholderMap {
         let mut m = PlaceholderMap::new();

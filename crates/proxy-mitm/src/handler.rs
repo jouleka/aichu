@@ -60,7 +60,7 @@ use hudsucker::{
 };
 use proxy_core::{PlaceholderMap, SseReverser};
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct AichuHandler {
     request_count: Arc<AtomicU64>,
     /// The `PlaceholderMap` minted for THIS request by
@@ -71,11 +71,40 @@ pub struct AichuHandler {
     /// `AichuHandler` (see module-level State threading note) so this
     /// field never has to mediate between concurrent streams.
     current_map: Option<PlaceholderMap>,
+    /// Whether to inject `proxy_core::PRESERVE_TOKENS_PROMPT` into
+    /// forwarded prompt-endpoint request bodies. Default ON — the
+    /// e03 eval measured this lifts guillemets preservation from
+    /// 12% to 96% on gpt-5-mini. The CLI's `--no-system-prompt`
+    /// flag toggles this off; see `crates/cli/src/main.rs`.
+    inject_system_prompt: bool,
+}
+
+impl Default for AichuHandler {
+    fn default() -> Self {
+        Self {
+            request_count: Arc::new(AtomicU64::new(0)),
+            current_map: None,
+            // Default ON — see the field doc comment for the rationale
+            // (and crates/cli/src/main.rs::Run for the flag wiring).
+            inject_system_prompt: true,
+        }
+    }
 }
 
 impl AichuHandler {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Toggle preserve-tokens system-prompt injection on or off.
+    /// Defaults to ON via `AichuHandler::new`; the CLI's
+    /// `--no-system-prompt` flag flips this off when set.
+    ///
+    /// Returns `self` so callers can chain in builder style next to
+    /// `AichuHandler::new()`.
+    pub fn with_inject_system_prompt(mut self, on: bool) -> Self {
+        self.inject_system_prompt = on;
+        self
     }
 
     /// Returns a handle to the request counter. Cheap to clone; intended for
@@ -105,6 +134,87 @@ fn is_prompt_endpoint(path: &str) -> bool {
             | "/zen/v1/responses"
             | "/zen/v1/chat/completions"
     )
+}
+
+/// Wire shape the system-prompt injector can safely mutate for a
+/// given path. Distinct from the redaction allow-list above — the
+/// `Responses`-family endpoints (`/v1/responses`, `/backend-api/codex/responses`,
+/// `/zen/v1/responses`) accept prompts but use a different wire
+/// shape (`input` instead of `messages`) that `proxy_core::system_prompt`
+/// does not handle in v0. Returning `None` for those keeps redaction
+/// running while skipping injection — we never silently mutate a
+/// body shape we don't model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InjectionShape {
+    /// Anthropic `/v1/messages` — `system` is a top-level body field.
+    Anthropic,
+    /// OpenAI `/v1/chat/completions` (and the OpenCode zen alias) —
+    /// system goes as the first element of `messages` with
+    /// `role: "system"`.
+    OpenAiChat,
+}
+
+fn injection_shape_for(path: &str) -> Option<InjectionShape> {
+    match path {
+        "/v1/messages" => Some(InjectionShape::Anthropic),
+        "/v1/chat/completions" | "/zen/v1/chat/completions" => Some(InjectionShape::OpenAiChat),
+        _ => None,
+    }
+}
+
+/// Parse `body_str` as JSON, dispatch to the shape-matching
+/// `proxy_core::system_prompt` injector, and re-serialize. Returns
+/// the original `body_str` unchanged when:
+///   - `shape` is `None` (the path is a known prompt endpoint but
+///     not one of the wire shapes we know how to mutate — e.g. the
+///     Responses-family endpoints), or
+///   - the body is not valid JSON (we fail loud: log at warn and
+///     forward unmodified rather than rewriting a body we can't
+///     parse — per CLAUDE.md Rule 12).
+///
+/// MUST be called AFTER redaction; see the call site for the
+/// ordering rationale (the prompt itself contains `«SECRET_*»`
+/// example strings that would otherwise get caught by the
+/// detector).
+fn inject_after_redact(body_str: &str, shape: Option<InjectionShape>) -> String {
+    let Some(shape) = shape else {
+        return body_str.to_string();
+    };
+    let mut value: serde_json::Value = match serde_json::from_str(body_str) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "request body is not valid JSON on a known prompt endpoint; \
+                 skipping system-prompt injection and forwarding unchanged",
+            );
+            return body_str.to_string();
+        }
+    };
+    match shape {
+        InjectionShape::Anthropic => proxy_core::inject_anthropic(&mut value),
+        InjectionShape::OpenAiChat => proxy_core::inject_openai(&mut value),
+    }
+    // serde_json::to_string emits compact JSON. The wire never
+    // requires the upstream to see pretty-printed bytes, and compact
+    // serialization keeps the redacted size invariant we relied on
+    // when stripping content-length above.
+    match serde_json::to_string(&value) {
+        Ok(s) => s,
+        Err(e) => {
+            // serde_json::to_string only fails on serializer errors
+            // (e.g. Map key that isn't a string) — practically
+            // unreachable for a Value we just parsed. Surface at
+            // warn and forward the redacted body unmodified so the
+            // request still goes through.
+            tracing::warn!(
+                error = %e,
+                "failed to re-serialize JSON after system-prompt injection; \
+                 forwarding redacted body without injection",
+            );
+            body_str.to_string()
+        }
+    }
 }
 
 impl HttpHandler for AichuHandler {
@@ -143,7 +253,16 @@ impl HttpHandler for AichuHandler {
 
         // Redact: bytes → str → redact → bytes. Same UTF-8 round-trip
         // pattern e02 uses. Non-UTF-8 bodies forward unchanged.
+        //
+        // The system-prompt injection runs AFTER redaction, BEFORE
+        // forwarding (the order is load-bearing: if injection ran
+        // first, the preserve-tokens prompt's own example strings
+        // like `«SECRET_AWS_KEY_001»` would be picked up by the
+        // detector and reverse-substituted back into actual secret
+        // text on the response side — corrupting the prompt that
+        // makes the proxy work).
         let mut map = PlaceholderMap::new();
+        let inject_shape = injection_shape_for(parts.uri.path());
         let new_body = match std::str::from_utf8(&body_bytes) {
             Ok(s) => {
                 let redacted = proxy_core::redact(s, &mut map);
@@ -153,7 +272,12 @@ impl HttpHandler for AichuHandler {
                         "redacted outbound body before forwarding upstream",
                     );
                 }
-                Body::from(Bytes::from(redacted))
+                let final_body = if self.inject_system_prompt {
+                    inject_after_redact(&redacted, inject_shape)
+                } else {
+                    redacted
+                };
+                Body::from(Bytes::from(final_body))
             }
             Err(_) => {
                 tracing::debug!("non-utf8 inbound body, forwarding without redaction");

@@ -31,6 +31,24 @@ pub struct RelayConfig {
     /// Base URL forwarded to for `POST /v1/chat/completions`.
     /// Example: `https://api.openai.com`.
     pub openai_upstream: String,
+    /// Whether to inject `proxy_core::PRESERVE_TOKENS_PROMPT` into
+    /// forwarded prompt-endpoint request bodies. Default ON via
+    /// `Default::default()` — the e03 eval measured this lifts
+    /// guillemets preservation from 12% to 96% on gpt-5-mini. The
+    /// CLI's `--no-system-prompt` flag toggles this off.
+    pub inject_system_prompt: bool,
+}
+
+impl Default for RelayConfig {
+    fn default() -> Self {
+        Self {
+            // Real upstreams; tests override with the mock upstream's
+            // ephemeral address.
+            anthropic_upstream: "https://api.anthropic.com".to_string(),
+            openai_upstream: "https://api.openai.com".to_string(),
+            inject_system_prompt: true,
+        }
+    }
 }
 
 /// Build the relay's axum router. Exposed for tests that want to spawn the

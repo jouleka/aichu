@@ -34,6 +34,11 @@ async fn relay_streams_anthropic_sse_intact() -> Result<()> {
     let config = RelayConfig {
         anthropic_upstream: format!("http://{}", upstream.addr),
         openai_upstream: "http://127.0.0.1:1".to_string(), // unused for this test
+        // Pre-existing tests opt out of the preserve-tokens system-
+        // prompt injection so their body-content assertions stay
+        // focused on the SSE forwarding contract being pinned here.
+        // Injection has its own dedicated tests in relay_redacts.rs.
+        inject_system_prompt: false,
     };
 
     let (relay_addr, shutdown_tx) = spawn_relay(config).await?;
@@ -117,6 +122,8 @@ async fn relay_streams_openai_chat_completions_chunks_over_time() -> Result<()> 
     let config = RelayConfig {
         anthropic_upstream: "http://127.0.0.1:1".to_string(), // unused
         openai_upstream: format!("http://{}", upstream.addr),
+        // See the first test's rationale.
+        inject_system_prompt: false,
     };
 
     let (relay_addr, shutdown_tx) = spawn_relay(config).await?;
@@ -230,6 +237,8 @@ async fn phase_2c_relay_streams_chunks_over_time_with_secrets_present() -> Resul
     let config = RelayConfig {
         anthropic_upstream: format!("http://{}", upstream.addr),
         openai_upstream: "http://127.0.0.1:1".to_string(),
+        // See the first test's rationale.
+        inject_system_prompt: false,
     };
     let (relay_addr, shutdown_tx) = spawn_relay(config).await?;
 

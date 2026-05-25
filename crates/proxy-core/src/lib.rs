@@ -33,12 +33,14 @@ pub mod placeholder;
 pub mod reverse;
 pub mod rules;
 pub mod sse;
+pub mod system_prompt;
 
 pub use detector::scan;
 pub use placeholder::{PlaceholderFormat, PlaceholderMap};
 pub use reverse::reverse;
 pub use rules::SecretKind;
 pub use sse::SseReverser;
+pub use system_prompt::{PRESERVE_TOKENS_PROMPT, inject_anthropic, inject_openai};
 
 /// One detected secret. Byte offsets are into the original `&str` passed
 /// to `scan`; substring slicing via `&input[finding.start..finding.end]`

@@ -69,7 +69,11 @@ async fn handle_anthropic_messages(
     req: Request,
 ) -> Response<Body> {
     let url = format!("{}/v1/messages", state.config.anthropic_upstream);
-    forward(state.http, url, req).await
+    let inject = state
+        .config
+        .inject_system_prompt
+        .then_some(InjectionShape::Anthropic);
+    forward(state.http, url, req, inject).await
 }
 
 async fn handle_openai_chat(
@@ -77,7 +81,24 @@ async fn handle_openai_chat(
     req: Request,
 ) -> Response<Body> {
     let url = format!("{}/v1/chat/completions", state.config.openai_upstream);
-    forward(state.http, url, req).await
+    let inject = state
+        .config
+        .inject_system_prompt
+        .then_some(InjectionShape::OpenAiChat);
+    forward(state.http, url, req, inject).await
+}
+
+/// Wire shape the system-prompt injector can safely mutate. Mirrors
+/// the proxy-mitm crate's `InjectionShape`. We keep two copies (one
+/// here, one in proxy-mitm) rather than re-exporting from proxy-core
+/// because the routing decision is made by the dispatcher (axum
+/// router vs hudsucker handler), not by proxy-core — and the two
+/// dispatchers reach the request differently. The variants must
+/// stay in sync; if more shapes land, factor into proxy-core.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InjectionShape {
+    Anthropic,
+    OpenAiChat,
 }
 
 /// Forward `req` to `url` over reqwest. Hop-by-hop headers are stripped
@@ -97,7 +118,12 @@ async fn handle_openai_chat(
 ///     then emitted as a non-streaming Body. Applies to
 ///     `application/json` and anything else (non-streaming endpoints
 ///     can't lose streaming they didn't have).
-async fn forward(client: Client, url: String, req: Request) -> Response<Body> {
+async fn forward(
+    client: Client,
+    url: String,
+    req: Request,
+    inject_shape: Option<InjectionShape>,
+) -> Response<Body> {
     let (parts, body) = req.into_parts();
 
     // Read the inbound body. LLM request bodies are small (JSON prompts +
@@ -135,7 +161,16 @@ async fn forward(client: Client, url: String, req: Request) -> Response<Body> {
                     "redacted outbound body before forwarding to {url}",
                 );
             }
-            Bytes::from(redacted)
+            // System-prompt injection runs AFTER redaction (the
+            // same ordering proxy-mitm uses). If injection ran
+            // before redaction, the preserve-tokens prompt's own
+            // schema text (`«SECRET_<TYPE>_<NNN>»`) is harmless to
+            // the detector (no `[0-9]+`), but a future drift to a
+            // literal-counter example would silently get redacted
+            // and shrink the prompt. Keep the ordering invariant
+            // explicit at the call site.
+            let final_body = inject_after_redact(&redacted, inject_shape);
+            Bytes::from(final_body)
         }
         Err(_) => {
             // Non-UTF-8 body (binary?). Pass through unchanged; the
@@ -331,6 +366,52 @@ where
             }
         },
     )
+}
+
+/// Parse `body_str` as JSON, dispatch to the shape-matching
+/// `proxy_core::system_prompt` injector, and re-serialize. Returns
+/// the original `body_str` unchanged when:
+///   - `shape` is `None` (injection disabled by config or not a
+///     known shape), or
+///   - the body is not valid JSON (we fail loud: log at warn and
+///     forward unmodified rather than rewriting a body we can't
+///     parse — per CLAUDE.md Rule 12).
+///
+/// MUST be called AFTER redaction; the call site enforces the
+/// ordering invariant and documents the reason.
+fn inject_after_redact(body_str: &str, shape: Option<InjectionShape>) -> String {
+    let Some(shape) = shape else {
+        return body_str.to_string();
+    };
+    let mut value: serde_json::Value = match serde_json::from_str(body_str) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "request body is not valid JSON on a known prompt endpoint; \
+                 skipping system-prompt injection and forwarding unchanged",
+            );
+            return body_str.to_string();
+        }
+    };
+    match shape {
+        InjectionShape::Anthropic => proxy_core::inject_anthropic(&mut value),
+        InjectionShape::OpenAiChat => proxy_core::inject_openai(&mut value),
+    }
+    // Compact serialization — the wire does not require pretty-
+    // printed bytes, and keeping output compact matches the
+    // pre-injection size profile (we only added one field/element).
+    match serde_json::to_string(&value) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "failed to re-serialize JSON after system-prompt injection; \
+                 forwarding redacted body without injection",
+            );
+            body_str.to_string()
+        }
+    }
 }
 
 fn error_response(status: StatusCode, msg: String) -> Response<Body> {

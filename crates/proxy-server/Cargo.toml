@@ -22,6 +22,9 @@ futures-util = { workspace = true }
 bytes = { workspace = true }
 tracing = { workspace = true }
 anyhow = { workspace = true }
+# System-prompt injection parses the redacted request body as JSON,
+# mutates it via `proxy_core::system_prompt::inject_*`, and re-serializes.
+serde_json = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time", "net"] }

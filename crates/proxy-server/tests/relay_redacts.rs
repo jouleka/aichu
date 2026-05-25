@@ -32,6 +32,14 @@ async fn relay_redacts_aws_key_before_forwarding() -> Result<()> {
     let config = RelayConfig {
         anthropic_upstream: format!("http://{}", upstream.addr),
         openai_upstream: "http://127.0.0.1:1".to_string(), // unused
+        // Pre-existing tests pin redaction/reverse contracts that
+        // pre-date the preserve-tokens injection feature. Disabling
+        // injection here keeps each test focused on its named
+        // contract (a body-content assertion that searches for
+        // `«SECRET_` substrings would otherwise hit the schema text
+        // in our injected prompt). The injection feature has its
+        // own dedicated tests below.
+        inject_system_prompt: false,
     };
     let (relay_addr, shutdown_tx) = spawn_relay(config).await?;
 
@@ -99,6 +107,10 @@ async fn relay_passes_through_body_with_no_secrets_unchanged() -> Result<()> {
     let config = RelayConfig {
         anthropic_upstream: format!("http://{}", upstream.addr),
         openai_upstream: "http://127.0.0.1:1".to_string(),
+        // See the first test's rationale: pre-existing tests opt
+        // out of injection so their body-content assertions don't
+        // need updating.
+        inject_system_prompt: false,
     };
     let (relay_addr, shutdown_tx) = spawn_relay(config).await?;
 
@@ -163,6 +175,10 @@ async fn relay_reverses_placeholder_in_non_streaming_json_response() -> Result<(
     let config = RelayConfig {
         anthropic_upstream: format!("http://{}", upstream.addr),
         openai_upstream: "http://127.0.0.1:1".to_string(),
+        // See the first test's rationale: pre-existing tests opt
+        // out of injection so their body-content assertions don't
+        // need updating.
+        inject_system_prompt: false,
     };
     let (relay_addr, shutdown_tx) = spawn_relay(config).await?;
 
@@ -232,6 +248,10 @@ async fn relay_reverses_placeholder_in_streaming_sse_response() -> Result<()> {
     let config = RelayConfig {
         anthropic_upstream: format!("http://{}", upstream.addr),
         openai_upstream: "http://127.0.0.1:1".to_string(),
+        // See the first test's rationale: pre-existing tests opt
+        // out of injection so their body-content assertions don't
+        // need updating.
+        inject_system_prompt: false,
     };
     let (relay_addr, shutdown_tx) = spawn_relay(config).await?;
 
@@ -300,6 +320,10 @@ async fn phase_2c_relay_reverses_placeholder_split_across_sse_events() -> Result
     let config = RelayConfig {
         anthropic_upstream: format!("http://{}", upstream.addr),
         openai_upstream: "http://127.0.0.1:1".to_string(),
+        // See the first test's rationale: pre-existing tests opt
+        // out of injection so their body-content assertions don't
+        // need updating.
+        inject_system_prompt: false,
     };
     let (relay_addr, shutdown_tx) = spawn_relay(config).await?;
 
@@ -325,6 +349,150 @@ async fn phase_2c_relay_reverses_placeholder_split_across_sse_events() -> Result
     // Phase 2c desired behavior:
     assert!(body.contains("AKIAIOSFODNN7EXAMPLE"));
     assert!(!body.contains("\u{ab}SECRET_"));
+
+    let _ = shutdown_tx.send(());
+    Ok(())
+}
+
+/// Mode A counterpart to proxy-mitm's
+/// `mitm_injects_preserve_tokens_system_prompt_into_anthropic_request`.
+/// When `inject_system_prompt: true`, the forwarded Anthropic body
+/// must carry `PRESERVE_TOKENS_PROMPT` in the `system` field. End-to-
+/// end-equivalent: a user running the relay (Mode A) gets the same
+/// e03-measured preservation boost as a user running the MITM proxy
+/// (Mode B).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn relay_injects_preserve_tokens_system_prompt_into_anthropic_request() -> Result<()> {
+    let upstream = spawn_capturing_upstream("/v1/messages").await?;
+    let config = RelayConfig {
+        anthropic_upstream: format!("http://{}", upstream.addr),
+        openai_upstream: "http://127.0.0.1:1".to_string(),
+        inject_system_prompt: true,
+    };
+    let (relay_addr, shutdown_tx) = spawn_relay(config).await?;
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()?;
+    let _ = client
+        .post(format!("http://{relay_addr}/v1/messages"))
+        .header("x-api-key", "fake-test-key")
+        .json(&json!({
+            "model": "claude-opus-4-5",
+            "max_tokens": 100,
+            "messages": [{
+                "role": "user",
+                "content": "Debug AKIAIOSFODNN7EXAMPLE on S3.",
+            }],
+        }))
+        .send()
+        .await?;
+
+    let captured = upstream.last_body.lock().unwrap().clone().expect("body");
+    let parsed: Value = serde_json::from_str(std::str::from_utf8(&captured)?)?;
+
+    // System field present and starts with our prompt (preserves any
+    // future client-supplied tail via the inject helper's prepend).
+    let system_text = parsed["system"].as_str().expect("system is string");
+    assert!(
+        system_text.starts_with(proxy_core::PRESERVE_TOKENS_PROMPT),
+        "preserve-tokens prompt must be at the front of `system`; got: {system_text}"
+    );
+
+    // Redaction still works alongside injection. The pair pins
+    // ordering: redact first, then inject.
+    let user_content = parsed["messages"][0]["content"]
+        .as_str()
+        .expect("user content is string");
+    assert!(user_content.contains("\u{ab}SECRET_AWS_KEY_001\u{bb}"));
+    assert!(!user_content.contains("AKIAIOSFODNN7EXAMPLE"));
+
+    let _ = shutdown_tx.send(());
+    Ok(())
+}
+
+/// Mode A counterpart for OpenAI Chat Completions. Inserts a new
+/// system message at index 0 when no client system message exists.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn relay_injects_preserve_tokens_system_prompt_into_openai_chat_request() -> Result<()> {
+    let upstream = spawn_capturing_upstream("/v1/chat/completions").await?;
+    let config = RelayConfig {
+        anthropic_upstream: "http://127.0.0.1:1".to_string(),
+        openai_upstream: format!("http://{}", upstream.addr),
+        inject_system_prompt: true,
+    };
+    let (relay_addr, shutdown_tx) = spawn_relay(config).await?;
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()?;
+    let _ = client
+        .post(format!("http://{relay_addr}/v1/chat/completions"))
+        .header("authorization", "Bearer fake-test-key")
+        .json(&json!({
+            "model": "gpt-5-mini",
+            "messages": [{
+                "role": "user",
+                "content": "Debug AKIAIOSFODNN7EXAMPLE on S3.",
+            }],
+        }))
+        .send()
+        .await?;
+
+    let captured = upstream.last_body.lock().unwrap().clone().expect("body");
+    let parsed: Value = serde_json::from_str(std::str::from_utf8(&captured)?)?;
+    let messages = parsed["messages"].as_array().expect("messages is array");
+
+    assert_eq!(messages[0]["role"], "system");
+    assert_eq!(messages[0]["content"], proxy_core::PRESERVE_TOKENS_PROMPT);
+    assert_eq!(messages[1]["role"], "user");
+    let user_content = messages[1]["content"].as_str().expect("user content is string");
+    assert!(user_content.contains("\u{ab}SECRET_AWS_KEY_001\u{bb}"));
+    assert!(!user_content.contains("AKIAIOSFODNN7EXAMPLE"));
+
+    let _ = shutdown_tx.send(());
+    Ok(())
+}
+
+/// Pins the `--no-system-prompt` opt-out for Mode A. With injection
+/// off, the forwarded body must NOT contain our preserve-tokens
+/// text — redaction still runs. Mirrors the Mode B
+/// `mitm_does_not_inject_when_disabled` test.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn relay_does_not_inject_when_disabled() -> Result<()> {
+    let upstream = spawn_capturing_upstream("/v1/messages").await?;
+    let config = RelayConfig {
+        anthropic_upstream: format!("http://{}", upstream.addr),
+        openai_upstream: "http://127.0.0.1:1".to_string(),
+        inject_system_prompt: false,
+    };
+    let (relay_addr, shutdown_tx) = spawn_relay(config).await?;
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()?;
+    let _ = client
+        .post(format!("http://{relay_addr}/v1/messages"))
+        .header("x-api-key", "fake-test-key")
+        .json(&json!({
+            "model": "claude-opus-4-5",
+            "max_tokens": 100,
+            "messages": [{"role": "user", "content": "AKIAIOSFODNN7EXAMPLE"}],
+        }))
+        .send()
+        .await?;
+
+    let captured = upstream.last_body.lock().unwrap().clone().expect("body");
+    let captured_str = std::str::from_utf8(&captured)?;
+    let parsed: Value = serde_json::from_str(captured_str)?;
+    assert!(
+        parsed.get("system").is_none(),
+        "system field must be absent when injection is off; got: {captured_str}"
+    );
+    assert!(
+        captured_str.contains("\u{ab}SECRET_AWS_KEY_001\u{bb}"),
+        "redaction must still run when injection is off"
+    );
 
     let _ = shutdown_tx.send(());
     Ok(())

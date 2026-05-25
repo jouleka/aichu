@@ -23,6 +23,11 @@ anyhow = { workspace = true }
 # Phase 2c: the SSE-aware streaming reverser wraps the upstream byte
 # stream with futures_util::stream::unfold.
 futures-util = { workspace = true }
+# System-prompt injection parses the redacted request body as JSON,
+# mutates it via `proxy_core::system_prompt::inject_*`, and re-serializes.
+# The detect/scan side does not need JSON parsing (it operates on raw
+# bytes), so this is a new dependency added with the injection step.
+serde_json = { workspace = true }
 
 [dev-dependencies]
 axum = { workspace = true }
