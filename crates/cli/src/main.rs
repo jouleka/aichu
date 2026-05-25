@@ -10,8 +10,10 @@
 //   - `aichu doctor`          — diagnose common setup issues
 //
 // Trust automation is implemented for macOS (System keychain) and
-// Debian-family Linux (`/usr/local/share/ca-certificates/`); other OSes
-// get a bail with manual instructions.
+// Linux (Debian-family via `/usr/local/share/ca-certificates/`, Red Hat-
+// family via `/etc/pki/ca-trust/source/anchors/`, Arch-family via
+// `/etc/ca-certificates/trust-source/anchors/`); other OSes get a bail
+// with manual instructions.
 //
 // Subcommands are NEVER stubbed — no speculative code (CLAUDE.md Rule 2).
 
@@ -38,10 +40,10 @@ enum Commands {
     /// Start the proxy on 127.0.0.1:8788 (default if no subcommand given).
     Run,
     /// Install the local CA into the OS trust store (macOS System keychain
-    /// or Debian-family /usr/local/share/ca-certificates; requires sudo).
+    /// or Linux: Debian/Red Hat/Arch families; requires sudo).
     Trust,
-    /// Remove the local CA from the OS trust store (macOS or Debian-family
-    /// Linux; requires sudo).
+    /// Remove the local CA from the OS trust store (macOS or Linux:
+    /// Debian/Red Hat/Arch families; requires sudo).
     Untrust,
     /// Diagnose common setup issues (CA presence, trust-store install, HTTPS_PROXY, port).
     Doctor,
@@ -175,6 +177,46 @@ const LINUX_DEBIAN_CERT_DEST: &str = "/usr/local/share/ca-certificates/aichu-ca.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 const LINUX_DEBIAN_SENTINEL: &str = "/etc/debian_version";
 
+/// On Red Hat-family distros (RHEL, Fedora, CentOS, Rocky, AlmaLinux),
+/// certs in `/etc/pki/ca-trust/source/anchors/` are picked up by
+/// `update-ca-trust` and consolidated into the system bundles at
+/// `/etc/pki/ca-trust/extracted/`. `.crt` extension is conventional
+/// (`update-ca-trust` accepts other extensions too, but `.crt` is
+/// what every guide and existing distro cert uses).
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+const LINUX_REDHAT_CERT_DEST: &str = "/etc/pki/ca-trust/source/anchors/aichu-ca.crt";
+
+/// On Arch-family distros, certs in `/etc/ca-certificates/trust-source/anchors/`
+/// are picked up by `trust extract-compat` (from p11-kit, which Arch
+/// ships in the `base` group) and merged into
+/// `/etc/ssl/certs/ca-certificates.crt`.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+const LINUX_ARCH_CERT_DEST: &str = "/etc/ca-certificates/trust-source/anchors/aichu-ca.crt";
+
+/// Path consulted to learn the distro family on non-Debian Linux. The
+/// freedesktop.org standard (`os-release(5)`) — shipped by every
+/// modern systemd-using distro, which is the entire Fedora/Arch
+/// universe we care about here.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+const LINUX_OS_RELEASE: &str = "/etc/os-release";
+
+/// The non-Debian Linux distro families we automate trust install for.
+/// Kept as an enum (rather than a string ID) so the `match` in
+/// `linux_family_install_path` is exhaustive — adding a future family
+/// without wiring up its install path becomes a compile error.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LinuxFamily {
+    /// RHEL, Fedora, CentOS, Rocky, AlmaLinux — anything that ships
+    /// `update-ca-trust` and the `/etc/pki/ca-trust/source/anchors/`
+    /// layout.
+    RedHat,
+    /// Arch, Manjaro, EndeavourOS — anything that ships
+    /// `trust extract-compat` (p11-kit) and the
+    /// `/etc/ca-certificates/trust-source/anchors/` layout.
+    Arch,
+}
+
 #[cfg(target_os = "linux")]
 fn handle_trust() -> Result<()> {
     let cert_src = ca_dir()?.join(proxy_mitm::ca::CERT_FILENAME);
@@ -185,49 +227,99 @@ fn handle_trust() -> Result<()> {
             cert_src.display()
         );
     }
-    if !is_debian_family(|p| Path::new(p).exists()) {
-        anyhow::bail!(
-            "`aichu trust` on Linux currently supports Debian-family distros \
-             only (Debian, Ubuntu, Mint, Pop!_OS, Kali, etc.). For \
-             RHEL/Fedora/Arch/Alpine: copy {} into your distro's trust-anchor \
-             directory and run the appropriate update command \
-             (`update-ca-trust extract`, `trust anchor`, etc.).",
+
+    // Debian-family kept on the sentinel-file check for stability (Rule
+    // 3 — don't refactor what isn't broken). RH/Arch families come from
+    // `/etc/os-release` (freedesktop.org standard); see
+    // `linux_family_from_os_release` for the rationale.
+    if is_debian_family(|p| Path::new(p).exists()) {
+        let dest = Path::new(LINUX_DEBIAN_CERT_DEST);
+        let mut cp = linux_trust_copy_command(&cert_src, dest);
+        tracing::info!(
+            "copying CA into the system trust source — sudo will prompt for your password (src: {})",
             cert_src.display()
         );
+        run_or_bail(&mut cp, "CA copy")?;
+        let mut upd = linux_trust_update_command();
+        tracing::info!("rebuilding system trust bundle (update-ca-certificates)...");
+        run_or_bail(&mut upd, "trust update")?;
+        tracing::info!("CA installed into the system trust store ✓");
+        return Ok(());
     }
-    let mut cp = linux_trust_copy_command(&cert_src, Path::new(LINUX_DEBIAN_CERT_DEST));
-    tracing::info!(
-        "copying CA into the system trust source — sudo will prompt for your password (src: {})",
-        cert_src.display()
-    );
-    run_or_bail(&mut cp, "CA copy")?;
-    let mut upd = linux_trust_update_command();
-    tracing::info!("rebuilding system trust bundle (update-ca-certificates)...");
-    run_or_bail(&mut upd, "trust update")?;
-    tracing::info!("CA installed into the system trust store ✓");
-    Ok(())
+
+    let family = read_os_release()
+        .as_deref()
+        .and_then(linux_family_from_os_release);
+    match family {
+        Some(fam) => {
+            let dest_str = linux_family_install_path(fam);
+            let dest = Path::new(dest_str);
+            let mut cp = linux_trust_copy_command(&cert_src, dest);
+            tracing::info!(
+                "copying CA into the system trust source — sudo will prompt for your password (src: {})",
+                cert_src.display()
+            );
+            run_or_bail(&mut cp, "CA copy")?;
+            let mut upd = linux_family_refresh_command(fam);
+            tracing::info!("rebuilding system trust bundle ({})...", linux_family_refresh_label(fam));
+            run_or_bail(&mut upd, "trust update")?;
+            tracing::info!("CA installed into the system trust store ✓");
+            Ok(())
+        }
+        None => anyhow::bail!(
+            "`aichu trust` on Linux supports Debian-family, Red Hat-family, \
+             and Arch-family distros. Could not determine your distro family \
+             from `/etc/os-release`. Copy {} into your distro's trust-anchor \
+             directory and run the appropriate update command manually \
+             (e.g. `update-ca-trust`, `trust extract-compat`, `trust anchor`).",
+            cert_src.display()
+        ),
+    }
 }
 
 #[cfg(target_os = "linux")]
 fn handle_untrust() -> Result<()> {
-    if !is_debian_family(|p| Path::new(p).exists()) {
-        anyhow::bail!(
-            "`aichu untrust` on Linux currently supports Debian-family distros \
-             only. For other distros, remove the CA manually and re-run your \
-             distro's trust-update command."
+    if is_debian_family(|p| Path::new(p).exists()) {
+        let dest = Path::new(LINUX_DEBIAN_CERT_DEST);
+        let mut rm = linux_untrust_remove_command(dest);
+        tracing::info!(
+            "removing CA from {} — sudo will prompt for your password",
+            LINUX_DEBIAN_CERT_DEST
         );
+        run_or_bail(&mut rm, "CA removal")?;
+        let mut upd = linux_trust_update_command();
+        tracing::info!("rebuilding system trust bundle (update-ca-certificates)...");
+        run_or_bail(&mut upd, "trust update")?;
+        tracing::info!("CA removed from the system trust store ✓");
+        return Ok(());
     }
-    let mut rm = linux_untrust_remove_command(Path::new(LINUX_DEBIAN_CERT_DEST));
-    tracing::info!(
-        "removing CA from {} — sudo will prompt for your password",
-        LINUX_DEBIAN_CERT_DEST
-    );
-    run_or_bail(&mut rm, "CA removal")?;
-    let mut upd = linux_trust_update_command();
-    tracing::info!("rebuilding system trust bundle (update-ca-certificates)...");
-    run_or_bail(&mut upd, "trust update")?;
-    tracing::info!("CA removed from the system trust store ✓");
-    Ok(())
+
+    let family = read_os_release()
+        .as_deref()
+        .and_then(linux_family_from_os_release);
+    match family {
+        Some(fam) => {
+            let dest_str = linux_family_install_path(fam);
+            let dest = Path::new(dest_str);
+            let mut rm = linux_untrust_remove_command(dest);
+            tracing::info!(
+                "removing CA from {} — sudo will prompt for your password",
+                dest_str
+            );
+            run_or_bail(&mut rm, "CA removal")?;
+            let mut upd = linux_family_refresh_command(fam);
+            tracing::info!("rebuilding system trust bundle ({})...", linux_family_refresh_label(fam));
+            run_or_bail(&mut upd, "trust update")?;
+            tracing::info!("CA removed from the system trust store ✓");
+            Ok(())
+        }
+        None => anyhow::bail!(
+            "`aichu untrust` on Linux supports Debian-family, Red Hat-family, \
+             and Arch-family distros. Could not determine your distro family \
+             from `/etc/os-release`. Remove the CA manually and re-run your \
+             distro's trust-update command."
+        ),
+    }
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
@@ -293,6 +385,128 @@ fn linux_untrust_remove_command(cert_dest: &Path) -> Command {
     let mut cmd = Command::new("sudo");
     cmd.arg("rm").arg("-f").arg(cert_dest);
     cmd
+}
+
+/// Read `/etc/os-release` at runtime. Only called from the Linux trust
+/// handlers; tests drive `linux_family_from_os_release` directly with
+/// fixture strings (no filesystem dependency in the test path).
+#[cfg(target_os = "linux")]
+fn read_os_release() -> Option<String> {
+    std::fs::read_to_string(LINUX_OS_RELEASE).ok()
+}
+
+/// Parse a `/etc/os-release` body and resolve it to a known
+/// `LinuxFamily`, or `None` if neither `ID` nor `ID_LIKE` identifies a
+/// family we automate.
+///
+/// Per `os-release(5)`: keys are `KEY=VALUE`, optionally with the
+/// value double-quoted; `ID_LIKE` is space-separated. We tokenize
+/// both and match any token against known IDs. Comments and blank
+/// lines are skipped.
+///
+/// Order matters: `ID` is checked before `ID_LIKE`. A Manjaro box
+/// ships `ID=manjaro ID_LIKE=arch` — the `ID` half is what makes us
+/// confident the user is on an Arch derivative; `ID_LIKE` alone
+/// (e.g. `ID=somefork ID_LIKE=arch`) is a softer signal but we accept
+/// it because that's why the spec defines `ID_LIKE` in the first
+/// place.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn linux_family_from_os_release(body: &str) -> Option<LinuxFamily> {
+    let (mut id, mut id_like): (Option<String>, Option<String>) = (None, None);
+    for line in body.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((k, v)) = line.split_once('=') else {
+            continue;
+        };
+        let v = v.trim().trim_matches('"').to_string();
+        match k.trim() {
+            "ID" => id = Some(v),
+            "ID_LIKE" => id_like = Some(v),
+            _ => {}
+        }
+    }
+
+    // Collect every candidate token (ID + ID_LIKE words) into a list,
+    // lowercased — `os-release` doesn't formally require lowercase but
+    // every real-world distro uses it; this is defensive.
+    let mut tokens: Vec<String> = Vec::new();
+    if let Some(s) = id {
+        tokens.push(s.to_lowercase());
+    }
+    if let Some(s) = id_like {
+        tokens.extend(s.split_whitespace().map(|t| t.to_lowercase()));
+    }
+
+    // Order of the family checks doesn't matter — the token sets are
+    // disjoint (no distro identifies as both red-hat-family and arch-
+    // family). If that ever changes, the first match wins and we'd
+    // need to revisit.
+    const REDHAT_IDS: &[&str] = &[
+        "fedora", "rhel", "centos", "rocky", "almalinux", "ol", "oracle",
+    ];
+    // Derivatives that ship `ID_LIKE=arch` (Garuda, ArcoLinux, etc.) are
+    // caught by the ID_LIKE token sweep above — kept off the explicit
+    // list to keep it minimal (Rule 2). Only `ID=` values that derivatives
+    // are likely to use AS THEIR OWN ID belong here.
+    const ARCH_IDS: &[&str] = &["arch", "manjaro", "endeavouros"];
+
+    if tokens.iter().any(|t| REDHAT_IDS.contains(&t.as_str())) {
+        return Some(LinuxFamily::RedHat);
+    }
+    if tokens.iter().any(|t| ARCH_IDS.contains(&t.as_str())) {
+        return Some(LinuxFamily::Arch);
+    }
+    None
+}
+
+/// Resolve the absolute filesystem path that the family's trust-anchor
+/// scanner picks up. Returning `&'static str` (rather than `&Path`)
+/// matches the existing `LINUX_DEBIAN_CERT_DEST` shape — the caller
+/// wraps in `Path::new` at the use site.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn linux_family_install_path(family: LinuxFamily) -> &'static str {
+    match family {
+        LinuxFamily::RedHat => LINUX_REDHAT_CERT_DEST,
+        LinuxFamily::Arch => LINUX_ARCH_CERT_DEST,
+    }
+}
+
+/// Build the per-family `sudo <refresh-tool>` command that consolidates
+/// the anchors directory into the consumed trust bundles.
+///
+/// Pure builder so the argv shape can be unit-tested without invoking
+/// `sudo` (which requires a TTY and has destructive side effects).
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn linux_family_refresh_command(family: LinuxFamily) -> Command {
+    let mut cmd = Command::new("sudo");
+    match family {
+        LinuxFamily::RedHat => {
+            // `update-ca-trust` (no arguments) is the standard refresh —
+            // implicit `extract` runs when anchors/ or blacklist/ have
+            // changed.
+            cmd.arg("update-ca-trust");
+        }
+        LinuxFamily::Arch => {
+            // `trust extract-compat` writes the legacy
+            // `/etc/ssl/certs/ca-certificates.crt` bundle that
+            // most TLS libs read on Arch.
+            cmd.arg("trust").arg("extract-compat");
+        }
+    }
+    cmd
+}
+
+/// Short human label for tracing — keeps the log messages tied to the
+/// actual command without re-running the builder.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn linux_family_refresh_label(family: LinuxFamily) -> &'static str {
+    match family {
+        LinuxFamily::RedHat => "update-ca-trust",
+        LinuxFamily::Arch => "trust extract-compat",
+    }
 }
 
 /// Build `sudo security add-trusted-cert -d -r trustRoot -k <keychain> <cert>`.
@@ -435,13 +649,12 @@ fn check_proxy_port_listening(addr: SocketAddr) -> CheckResult {
     }
 }
 
-/// Check 4 (Debian-family Linux only): does the CA cert exist at the
-/// destination path that `update-ca-certificates` picks up? File
-/// existence is a sufficient signal — if the file is there,
-/// `update-ca-certificates` would have folded it into
-/// `/etc/ssl/certs/ca-certificates.crt`. Verifying the *bundle*
-/// directly would require parsing PEM concatenations, which is more
-/// work than a check this proxy-y needs.
+/// Check 4 (Linux only): does the CA cert exist at the destination
+/// path that the distro's trust-update tool picks up? File existence
+/// is a sufficient signal — if the file is there, the distro's
+/// refresh command would have folded it into the consumed bundle.
+/// Verifying the bundle directly would require parsing PEM
+/// concatenations, which is more work than a check this proxy-y needs.
 ///
 /// Pure file-existence check, no subprocess. Compiles on every target
 /// so the unit test runs cross-OS.
@@ -454,6 +667,57 @@ fn check_linux_debian_trust_source(cert_dest: &Path) -> CheckResult {
             message: format!("CA not found at {}", cert_dest.display()),
             hint: "run `aichu trust` to install it (requires sudo)".into(),
         }
+    }
+}
+
+/// Doctor's Linux trust-source check, with per-family path routing
+/// done at runtime so a Fedora/Arch host doesn't get a misleading
+/// "Debian-family path missing" failure.
+///
+/// Detection mirrors `handle_trust` exactly: Debian sentinel first
+/// (cheapest check, also handles the most common Linux case), then
+/// `/etc/os-release` for RH/Arch. If detection fails, doctor reports
+/// `Fail` — `aichu trust` exits non-zero on this same host, so doctor
+/// must match that signal (Rule 12 — fail loud; the user should know
+/// trust automation won't work here without parsing log lines).
+#[cfg(target_os = "linux")]
+fn linux_doctor_trust_source_check() -> (&'static str, CheckResult) {
+    if is_debian_family(|p| Path::new(p).exists()) {
+        return (
+            "CA in trust source (Debian-family)",
+            check_linux_debian_trust_source(Path::new(LINUX_DEBIAN_CERT_DEST)),
+        );
+    }
+    let family = read_os_release()
+        .as_deref()
+        .and_then(linux_family_from_os_release);
+    match family {
+        Some(LinuxFamily::RedHat) => (
+            "CA in trust source (Red Hat-family)",
+            check_linux_debian_trust_source(Path::new(LINUX_REDHAT_CERT_DEST)),
+        ),
+        Some(LinuxFamily::Arch) => (
+            "CA in trust source (Arch-family)",
+            check_linux_debian_trust_source(Path::new(LINUX_ARCH_CERT_DEST)),
+        ),
+        None => ("CA in trust source", linux_doctor_unknown_family_result()),
+    }
+}
+
+/// The `Fail` result `linux_doctor_trust_source_check` returns when
+/// the host's family can't be detected. Factored out so the unknown-
+/// family branch is unit-testable cross-OS without needing a Linux
+/// host whose `/etc/os-release` is missing or malformed.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn linux_doctor_unknown_family_result() -> CheckResult {
+    CheckResult::Fail {
+        message: "Cannot detect Linux family from /etc/os-release; \
+                  manual cert install required"
+            .into(),
+        hint: "`aichu trust` cannot run on this host — install the CA \
+               manually into your distro's trust-anchor directory and \
+               run the appropriate update command"
+            .into(),
     }
 }
 
@@ -560,10 +824,7 @@ fn handle_doctor() -> Result<()> {
             ),
         ),
         #[cfg(target_os = "linux")]
-        (
-            "CA in trust source (Debian-family)",
-            check_linux_debian_trust_source(Path::new(LINUX_DEBIAN_CERT_DEST)),
-        ),
+        linux_doctor_trust_source_check(),
     ];
 
     for (label, result) in &checks {
@@ -858,6 +1119,26 @@ mod tests {
     }
 
     #[test]
+    fn doctor_fails_loud_on_unknown_distro() {
+        // On a Linux host with no Debian sentinel AND an unparseable
+        // `/etc/os-release`, `aichu trust` bails non-zero — so doctor
+        // MUST report `Fail`, not `Warn`. Pinning `Fail` here prevents
+        // a regression to a softer signal that would let users miss
+        // that trust automation cannot work on their host (Rule 12 —
+        // fail loud; Rule 9 — encodes WHY the signal matters: doctor
+        // must mirror what `aichu trust` would do).
+        match linux_doctor_unknown_family_result() {
+            CheckResult::Fail { message, .. } => {
+                assert!(
+                    message.contains("Cannot detect Linux family"),
+                    "message should name the detection failure: {message}"
+                );
+            }
+            other => panic!("expected Fail (mirroring `aichu trust` bail), got {other:?}"),
+        }
+    }
+
+    #[test]
     fn linux_untrust_remove_command_uses_rm_f_for_idempotency() {
         // The `-f` flag means rm succeeds even if the cert is already
         // gone — keeps `aichu untrust` idempotent against a partially-
@@ -873,6 +1154,219 @@ mod tests {
             args,
             vec!["rm", "-f", "/usr/local/share/ca-certificates/aichu-ca.crt"]
         );
+    }
+
+    // ---- Linux trust automation (Red Hat & Arch families) -------------------
+    //
+    // Detection here parses `/etc/os-release` (freedesktop.org's standard,
+    // shipped by every modern systemd-using distro) rather than a single
+    // sentinel file like `/etc/debian_version`. Two reasons: derivatives
+    // (Rocky, AlmaLinux, Manjaro, EndeavourOS) don't all ship a uniquely-
+    // named sentinel, and `ID_LIKE=` in `/etc/os-release` already
+    // encodes the "compatible with" relationship the install path
+    // depends on. The Debian path keeps its sentinel (Rule 3 — don't
+    // refactor what isn't broken).
+
+    /// A minimal `/etc/os-release` fixture for Fedora 40. The full file
+    /// has many more keys, but only `ID=` and `ID_LIKE=` drive routing.
+    fn fixture_os_release(id: &str, id_like: Option<&str>) -> String {
+        let mut s = format!("NAME=\"Test Distro\"\nID={id}\n");
+        if let Some(ilk) = id_like {
+            s.push_str(&format!("ID_LIKE=\"{ilk}\"\n"));
+        }
+        s.push_str("VERSION_ID=\"1\"\n");
+        s
+    }
+
+    #[test]
+    fn parses_fedora_as_redhat_family() {
+        // Fedora itself sets ID=fedora with no ID_LIKE — it IS the
+        // reference, not a derivative. Routing must succeed on the ID
+        // alone, without depending on ID_LIKE being present.
+        let os_release = fixture_os_release("fedora", None);
+        assert_eq!(linux_family_from_os_release(&os_release), Some(LinuxFamily::RedHat));
+    }
+
+    #[test]
+    fn parses_rhel_via_id_like_as_redhat_family() {
+        // Real RHEL ships ID=rhel with ID_LIKE="fedora". The detector
+        // must pick up RHEL on the ID alone — the ID_LIKE check is
+        // about derivatives that DON'T set a known ID.
+        let os_release = fixture_os_release("rhel", Some("fedora"));
+        assert_eq!(linux_family_from_os_release(&os_release), Some(LinuxFamily::RedHat));
+    }
+
+    #[test]
+    fn parses_centos_as_redhat_family() {
+        // CentOS Stream sets ID=centos with ID_LIKE="rhel fedora".
+        // The space-separated ID_LIKE is the freedesktop.org spec —
+        // parsing must tokenize it, not match the whole string.
+        let os_release = fixture_os_release("centos", Some("rhel fedora"));
+        assert_eq!(linux_family_from_os_release(&os_release), Some(LinuxFamily::RedHat));
+    }
+
+    #[test]
+    fn parses_rocky_as_redhat_family() {
+        // Rocky Linux ships ID=rocky with ID_LIKE="\"rhel centos fedora\"".
+        // Real-world ID_LIKE values are often quoted AND multi-token —
+        // both must round-trip through the parser.
+        let os_release = fixture_os_release("rocky", Some("rhel centos fedora"));
+        assert_eq!(linux_family_from_os_release(&os_release), Some(LinuxFamily::RedHat));
+    }
+
+    #[test]
+    fn parses_almalinux_as_redhat_family() {
+        // AlmaLinux uses ID=almalinux. Covering it explicitly because
+        // it's the other major RHEL rebuild after Rocky — if either is
+        // missed, a chunk of the production-RHEL user base gets no
+        // trust automation.
+        let os_release = fixture_os_release("almalinux", Some("rhel centos fedora"));
+        assert_eq!(linux_family_from_os_release(&os_release), Some(LinuxFamily::RedHat));
+    }
+
+    #[test]
+    fn parses_arch_as_arch_family() {
+        // Arch Linux ships ID=arch with no ID_LIKE — like Fedora, it's
+        // the reference, not a derivative. Routing must succeed on ID
+        // alone.
+        let os_release = fixture_os_release("arch", None);
+        assert_eq!(linux_family_from_os_release(&os_release), Some(LinuxFamily::Arch));
+    }
+
+    #[test]
+    fn parses_manjaro_as_arch_family() {
+        // Manjaro ships ID=manjaro with ID_LIKE=arch. The detector
+        // must accept either an exact-known ID or a known token in
+        // ID_LIKE — Manjaro tests both halves of that.
+        let os_release = fixture_os_release("manjaro", Some("arch"));
+        assert_eq!(linux_family_from_os_release(&os_release), Some(LinuxFamily::Arch));
+    }
+
+    #[test]
+    fn parses_endeavouros_as_arch_family() {
+        // EndeavourOS ships ID=endeavouros with ID_LIKE=arch. Same
+        // "ID_LIKE-only matches a known family" pattern as Manjaro.
+        let os_release = fixture_os_release("endeavouros", Some("arch"));
+        assert_eq!(linux_family_from_os_release(&os_release), Some(LinuxFamily::Arch));
+    }
+
+    #[test]
+    fn unknown_distro_returns_none() {
+        // An ID we don't know AND an ID_LIKE we don't know must NOT
+        // silently route to a wrong path (Rule 12 — fail loud). The
+        // caller is expected to bail with a clear "manual install"
+        // message when this returns None.
+        let os_release = fixture_os_release("haiku", Some("beos"));
+        assert_eq!(linux_family_from_os_release(&os_release), None);
+    }
+
+    #[test]
+    fn malformed_os_release_returns_none() {
+        // Garbage in must not crash and must not falsely identify a
+        // family. A missing ID line means we can't tell, so we bail
+        // out to the manual-install fallback.
+        let os_release = "this is not a valid os-release file\n";
+        assert_eq!(linux_family_from_os_release(os_release), None);
+    }
+
+    #[test]
+    fn redhat_and_arch_families_route_to_different_install_paths() {
+        // This is the actual invariant under test: a regression where
+        // both families resolve to the SAME path would silently break
+        // one of them on its real host (the file would be written to
+        // the wrong directory, `update-ca-trust` / `trust extract-compat`
+        // would not see it, and trust would silently fail). Pinning
+        // the per-family install paths AND asserting they differ
+        // catches that class of bug.
+        let rh = linux_family_install_path(LinuxFamily::RedHat);
+        let arch = linux_family_install_path(LinuxFamily::Arch);
+        assert_eq!(rh, "/etc/pki/ca-trust/source/anchors/aichu-ca.crt");
+        assert_eq!(arch, "/etc/ca-certificates/trust-source/anchors/aichu-ca.crt");
+        assert_ne!(rh, arch, "families must route to distinct paths");
+    }
+
+    #[test]
+    fn redhat_refresh_command_is_update_ca_trust() {
+        // Pin the argv. `update-ca-trust` (no arguments) is the
+        // canonical Fedora/RHEL refresh command — it processes both
+        // the source/anchors dir and the source/blacklist dir and
+        // rebuilds the consolidated bundle. Any drift here would
+        // silently break the post-install trust rebuild on RHEL hosts.
+        let cmd = linux_family_refresh_command(LinuxFamily::RedHat);
+        assert_eq!(cmd.get_program(), "sudo");
+        let args: Vec<&str> = cmd.get_args().filter_map(|a| a.to_str()).collect();
+        assert_eq!(args, vec!["update-ca-trust"]);
+    }
+
+    #[test]
+    fn arch_refresh_command_is_trust_extract_compat() {
+        // `trust extract-compat` (from p11-kit, which Arch ships in
+        // base) consolidates the trust-source/anchors dir into the
+        // legacy `/etc/ssl/certs/ca-certificates.crt` bundle that
+        // most TLS libraries read.
+        let cmd = linux_family_refresh_command(LinuxFamily::Arch);
+        assert_eq!(cmd.get_program(), "sudo");
+        let args: Vec<&str> = cmd.get_args().filter_map(|a| a.to_str()).collect();
+        assert_eq!(args, vec!["trust", "extract-compat"]);
+    }
+
+    #[test]
+    fn install_then_remove_at_redhat_path_round_trips() {
+        // Integration check: drive `install -m 644` + `rm -f` against
+        // a tempdir-rooted RedHat-family path and confirm the file
+        // appears then disappears. Sudo is omitted (the tempdir is
+        // user-writable), so the test runs on any host including
+        // macOS — what's exercised is the per-family path routing
+        // plus the underlying utilities behaving as expected.
+        let dir = tempfile::TempDir::new().unwrap();
+        let src = dir.path().join("aichu-ca.pem");
+        std::fs::write(&src, b"-----BEGIN CERTIFICATE-----\nfake\n-----END CERTIFICATE-----\n").unwrap();
+
+        // Mirror the RedHat anchors layout under the tempdir.
+        let anchors = dir.path().join("etc/pki/ca-trust/source/anchors");
+        std::fs::create_dir_all(&anchors).unwrap();
+        let dest = anchors.join("aichu-ca.crt");
+
+        // `install -m 644 <src> <dest>` — no sudo, tempdir is ours.
+        let status = Command::new("install")
+            .arg("-m").arg("644")
+            .arg(&src).arg(&dest)
+            .status().expect("install(1) available on POSIX hosts");
+        assert!(status.success(), "install failed: {status:?}");
+        assert!(dest.exists(), "cert should be at RedHat anchors path");
+
+        // `rm -f <dest>` — no sudo, idempotent.
+        let status = Command::new("rm").arg("-f").arg(&dest).status().unwrap();
+        assert!(status.success());
+        assert!(!dest.exists(), "cert should be gone after rm -f");
+    }
+
+    #[test]
+    fn install_then_remove_at_arch_path_round_trips() {
+        // Same shape as the RedHat round-trip but routed through the
+        // Arch path. The reason both tests exist (rather than one
+        // parameterized) is that a copy-paste regression where Arch
+        // routes to the RedHat anchors dir would pass a single
+        // parameterized test but fail this one — the duplication is
+        // load-bearing.
+        let dir = tempfile::TempDir::new().unwrap();
+        let src = dir.path().join("aichu-ca.pem");
+        std::fs::write(&src, b"-----BEGIN CERTIFICATE-----\nfake\n-----END CERTIFICATE-----\n").unwrap();
+
+        let anchors = dir.path().join("etc/ca-certificates/trust-source/anchors");
+        std::fs::create_dir_all(&anchors).unwrap();
+        let dest = anchors.join("aichu-ca.crt");
+
+        let status = Command::new("install")
+            .arg("-m").arg("644")
+            .arg(&src).arg(&dest)
+            .status().expect("install(1) available on POSIX hosts");
+        assert!(status.success(), "install failed: {status:?}");
+        assert!(dest.exists(), "cert should be at Arch anchors path");
+
+        let status = Command::new("rm").arg("-f").arg(&dest).status().unwrap();
+        assert!(status.success());
+        assert!(!dest.exists(), "cert should be gone after rm -f");
     }
 
     // ---- `aichu doctor` checks ------------------------------------------------

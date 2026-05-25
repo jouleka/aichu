@@ -29,7 +29,7 @@ Each experiment's README records its goal, run instructions, and result (✅/❌
 cargo install --path crates/cli
 
 # One-time: install the local CA into the OS trust store.
-# (sudo prompts for your login password; macOS + Debian-family Linux in v0.)
+# (sudo prompts for your login password; macOS + Linux (Debian, Red Hat, and Arch families) in v0.)
 aichu trust
 
 # Run the proxy. Listens on 127.0.0.1:8788; Ctrl-C to stop.
@@ -86,7 +86,7 @@ aichu/
 - `crates/proxy-core/`   — redaction pipeline, placeholder map (shared) ✅ shipped
 - `crates/proxy-mitm/`   — Mode B: Hudsucker MITM ✅ shipped
 - `crates/proxy-server/` — Mode A: localhost HTTP server, base-URL relay ✅ shipped
-- `crates/cli/`          — `aichu run | trust | untrust | doctor` ✅ shipped (macOS + Debian-family Linux; RHEL/Arch/Windows v1+)
+- `crates/cli/`          — `aichu run | trust | untrust | doctor` ✅ shipped (macOS + Linux (Debian, Red Hat, and Arch families); Windows v1+)
 
 ## v0 scope: CLI tools only
 
@@ -192,7 +192,7 @@ You are NOT trusting:
 
 - A system-wide CA install. Mode B mints a per-machine CA and asks the
   user to install it into the system trust store via an explicit
-  `aichu trust` command (macOS + Debian-family Linux shipped; RHEL/Arch/Windows v1+). For Mode A, no
+  `aichu trust` command (macOS + Linux (Debian, Red Hat, and Arch families) shipped; Windows v1+). For Mode A, no
   CA is installed at all.
 - Any third-party server. The proxy contacts your configured model
   provider only.
