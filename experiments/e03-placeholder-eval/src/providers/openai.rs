@@ -60,7 +60,7 @@ impl Model for OpenAiProvider {
         &self.name
     }
 
-    async fn complete(&self, prompt: &str) -> Result<ModelResponse> {
+    async fn complete(&self, system: Option<&str>, prompt: &str) -> Result<ModelResponse> {
         // `max_completion_tokens` (not `max_tokens`). Per OpenAI docs
         // `max_tokens` is deprecated and "not compatible with o-series
         // models"; gpt-5-mini and other newer reasoning-capable models
@@ -77,11 +77,20 @@ impl Model for OpenAiProvider {
         // models (gpt-4o, gpt-3.5) may reject or silently ignore the
         // parameter; gate on model id before pointing this provider at
         // them (e.g. `model_id.starts_with("gpt-5") || starts_with("o")`).
+        //
+        // System prompts go in as a `role: "system"` entry at the head
+        // of the messages array. When `system` is `None` we omit it so
+        // the body is byte-identical to the zero-shot baseline.
+        let mut messages = Vec::with_capacity(2);
+        if let Some(sys) = system {
+            messages.push(json!({"role": "system", "content": sys}));
+        }
+        messages.push(json!({"role": "user", "content": prompt}));
         let body = json!({
             "model": self.model_id,
             "max_completion_tokens": self.max_tokens,
             "reasoning_effort": "minimal",
-            "messages": [{"role": "user", "content": prompt}],
+            "messages": messages,
         });
 
         let url = format!("{}/v1/chat/completions", self.base_url);

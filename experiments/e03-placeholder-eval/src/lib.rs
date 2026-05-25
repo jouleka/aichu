@@ -13,9 +13,11 @@ pub mod providers;
 
 pub use fixtures::{Fixture, load_fixtures, parse_fixture};
 
+use std::fs;
+use std::path::Path;
 use std::time::Instant;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde::Serialize;
 
 pub use model::{Model, ModelResponse};
@@ -63,6 +65,11 @@ pub struct EvalResult {
 /// rendered placeholder (this is `String::replace`'s default and matches
 /// the production proxy's design per build-plan §7). `preserved` is then
 /// satisfied if the placeholder appears at least once in the response.
+///
+/// `system` is the optional system-prompt prefix (build-plan §9 option
+/// (a)). `None` keeps the request byte-identical to the zero-shot
+/// baseline.
+#[allow(clippy::too_many_arguments)] // 8 args is the natural shape for one eval cell; splitting into a struct adds types for one call site.
 pub async fn evaluate(
     fixture_name: &str,
     fixture_text: &str,
@@ -71,6 +78,7 @@ pub async fn evaluate(
     format: PlaceholderFormat,
     n: usize,
     model: &dyn Model,
+    system: Option<&str>,
 ) -> Result<EvalResult> {
     let placeholder = format.render(secret_type, n);
     if !fixture_text.contains(secret_text) {
@@ -82,7 +90,7 @@ pub async fn evaluate(
     let prompt = fixture_text.replace(secret_text, &placeholder);
 
     let start = Instant::now();
-    let resp = model.complete(&prompt).await?;
+    let resp = model.complete(system, &prompt).await?;
     let latency_ms = start.elapsed().as_millis() as u64;
 
     let preserved = resp.text.contains(&placeholder);
@@ -106,4 +114,55 @@ pub async fn evaluate(
         output_tokens: resp.output_tokens,
         response_excerpt: excerpt,
     })
+}
+
+/// Run the full (fixtures × formats) loop against `model` and write a
+/// JSON results array to `out_path` after EVERY cell. The per-call write
+/// is the load-bearing data-loss-prevention property: a kill mid-run
+/// (timeout, SIGINT, OOM, connection blip) leaves a syntactically-valid
+/// JSON array of N records on disk, where N is the number of cells that
+/// completed before the kill — not an empty file and not a stale file
+/// from a previous run. Without this, a $5+ API run that fails on call
+/// 251/300 loses 250 paid results.
+pub async fn run_loop(
+    fixtures: &[Fixture],
+    formats: &[PlaceholderFormat],
+    model: &dyn Model,
+    system: Option<&str>,
+    out_path: &Path,
+) -> Result<Vec<EvalResult>> {
+    let mut results = Vec::with_capacity(fixtures.len() * formats.len());
+    for (idx, fixture) in fixtures.iter().enumerate() {
+        for format in formats {
+            tracing::info!(
+                fixture = %fixture.name,
+                format = %format,
+                "evaluating"
+            );
+            let n = idx + 1;
+            let r = evaluate(
+                &fixture.name,
+                &fixture.text,
+                &fixture.secret_text,
+                &fixture.secret_type,
+                *format,
+                n,
+                model,
+                system,
+            )
+            .await?;
+            results.push(r);
+            // Persist after every successful cell. `fs::write` is
+            // single-syscall on Linux/macOS — not strictly atomic vs
+            // SIGKILL mid-write, but a crash window of microseconds
+            // beats losing 250 paid results to a hang at minute 30.
+            // The JSON is always a complete array of every result so
+            // far, so partial reads on the next run are trivially
+            // recoverable.
+            let json = serde_json::to_string_pretty(&results)?;
+            fs::write(out_path, json)
+                .with_context(|| format!("write {}", out_path.display()))?;
+        }
+    }
+    Ok(results)
 }

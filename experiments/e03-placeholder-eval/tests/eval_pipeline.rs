@@ -54,6 +54,7 @@ async fn echo_model_preserves_every_format() -> Result<()> {
             *fmt,
             1,
             &model,
+            None,
         )
         .await?;
         assert!(
@@ -87,6 +88,7 @@ async fn static_model_response_without_placeholder_yields_not_preserved() -> Res
         PlaceholderFormat::Guillemets,
         1,
         &model,
+        None,
     )
     .await?;
     assert!(!r.preserved, "static model response without placeholder should be preserved=false");
@@ -109,6 +111,7 @@ async fn evaluate_errors_when_fixture_does_not_contain_secret_text() -> Result<(
         PlaceholderFormat::Guillemets,
         1,
         &model,
+        None,
     )
     .await
     .expect_err("evaluate must error on no-op substitution");
@@ -139,6 +142,7 @@ async fn anthropic_provider_speaks_correct_wire_shape_against_mock() -> Result<(
         PlaceholderFormat::Guillemets,
         1,
         &provider,
+        None,
     )
     .await?;
 
@@ -195,6 +199,7 @@ async fn openai_provider_speaks_correct_wire_shape_against_mock() -> Result<()> 
         PlaceholderFormat::Guillemets,
         1,
         &provider,
+        None,
     )
     .await?;
 
@@ -244,6 +249,242 @@ async fn openai_provider_speaks_correct_wire_shape_against_mock() -> Result<()> 
         "max_completion_tokens must leave headroom for reasoning-capable \
          models; 512 was empirically too low for gpt-5-mini"
     );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn openai_provider_passes_system_message_in_messages_array() -> Result<()> {
+    // WHY (CLAUDE.md Rule 9): build-plan §9 option (a) — "tell the model
+    // to preserve `«...»` tokens verbatim" — is the cheapest next
+    // experiment. Its entire signal depends on the system instruction
+    // actually reaching the model. OpenAI's chat-completions API takes
+    // the system prompt as the FIRST entry of `messages` with
+    // `role: "system"`, NOT as a separate top-level field. A regression
+    // that drops the system message, puts it in the wrong slot, or
+    // mislabels its role would silently zero-out the §9(a) signal and
+    // we'd conclude (incorrectly) that the instruction has no effect.
+    // This test pins the wire shape before any real API budget burns.
+    let mock = spawn_openai_mock("Mock reply.").await?;
+
+    let provider = OpenAiProvider::new("gpt-5-mini-test", "sk-openai-mock-key")
+        .with_base_url(format!("http://{}", mock.addr));
+
+    let r = evaluate(
+        "mock-fixture",
+        "Please echo PLACEHOLDER_VALUE back.",
+        "PLACEHOLDER_VALUE",
+        "GENERIC",
+        PlaceholderFormat::Guillemets,
+        1,
+        &provider,
+        Some("preserve {{placeholders}} verbatim"),
+    )
+    .await?;
+    assert_eq!(r.model, "openai:gpt-5-mini-test");
+
+    let saw = mock
+        .last_seen
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("mock should have captured the request");
+    let messages = saw.body["messages"]
+        .as_array()
+        .expect("messages must be an array");
+    assert_eq!(
+        messages.len(),
+        2,
+        "with --instructions set, exactly two messages: system then user"
+    );
+    assert_eq!(messages[0]["role"], "system");
+    assert_eq!(messages[0]["content"], "preserve {{placeholders}} verbatim");
+    assert_eq!(messages[1]["role"], "user");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn anthropic_provider_passes_system_field_top_level() -> Result<()> {
+    // WHY (CLAUDE.md Rule 9): Anthropic's Messages API is unlike
+    // OpenAI's — `system` is a TOP-LEVEL field, NOT a role inside
+    // `messages`. Anthropic explicitly rejects `role: "system"` inside
+    // the messages array. A regression that put the system message in
+    // the messages array would either (a) get rejected with a 400 and
+    // burn nothing (loud), or (b) be silently misinterpreted if
+    // Anthropic ever loosens the rule (quiet — the §9(a) signal would
+    // then depend on the wire-shape error mode rather than the
+    // instruction's actual effect on placeholder preservation). Pin
+    // both the top-level `system` field AND the messages-array shape
+    // here so the regression fails fast and locally.
+    let mock = spawn_anthropic_mock("Mock reply.").await?;
+
+    let provider = AnthropicProvider::new("claude-opus-4-7-test", "sk-ant-mock-key")
+        .with_base_url(format!("http://{}", mock.addr));
+
+    let r = evaluate(
+        "mock-fixture",
+        "Please echo PLACEHOLDER_VALUE back.",
+        "PLACEHOLDER_VALUE",
+        "GENERIC",
+        PlaceholderFormat::Guillemets,
+        1,
+        &provider,
+        Some("preserve \u{ab}...\u{bb} verbatim"),
+    )
+    .await?;
+    assert_eq!(r.model, "anthropic:claude-opus-4-7-test");
+
+    let saw = mock
+        .last_seen
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("mock should have captured the request");
+    // Top-level `system` field is set.
+    assert_eq!(saw.body["system"], "preserve \u{ab}...\u{bb} verbatim");
+    // The messages array carries ONLY a user turn — no system role
+    // inside it. (Anthropic forbids `role: "system"` in messages.)
+    let messages = saw.body["messages"]
+        .as_array()
+        .expect("messages must be an array");
+    assert_eq!(messages.len(), 1, "anthropic messages array carries user only");
+    assert_eq!(messages[0]["role"], "user");
+    Ok(())
+}
+
+#[tokio::test]
+async fn incremental_write_persists_after_each_call() -> Result<()> {
+    // WHY (CLAUDE.md Rule 9): the previous version of the harness
+    // accumulated every `EvalResult` in memory and wrote the JSON
+    // file ONCE at the very end of the loop. A 300-call run against
+    // a $5+ provider that died on call 251/300 — to a SIGINT, an
+    // OOM, a connection blip, or an OS timeout — lost all 250 paid
+    // results. That is exactly the failure this incremental-write
+    // change exists to prevent. This test pins the load-bearing
+    // property: after every single completed cell, the output file
+    // must be a syntactically-valid JSON array containing exactly
+    // that many records. If a future refactor reverts to
+    // write-once-at-end, this test fails before any real run loses
+    // budget.
+    use e03_placeholder_eval::{Fixture, run_loop};
+    use std::fs;
+
+    // Three fixtures × one format = three cells, so we can observe
+    // monotonic length growth at every step. Pick a format that doesn't
+    // collide with the fixture text so the model echoes a distinct
+    // placeholder on each cell.
+    let fixtures = vec![
+        Fixture {
+            name: "fx-a".into(),
+            secret_text: "AKIA-FIRST".into(),
+            secret_type: "AWS_KEY".into(),
+            text: "first body with AKIA-FIRST inside".into(),
+        },
+        Fixture {
+            name: "fx-b".into(),
+            secret_text: "AKIA-SECOND".into(),
+            secret_type: "AWS_KEY".into(),
+            text: "second body with AKIA-SECOND inside".into(),
+        },
+        Fixture {
+            name: "fx-c".into(),
+            secret_text: "AKIA-THIRD".into(),
+            secret_type: "AWS_KEY".into(),
+            text: "third body with AKIA-THIRD inside".into(),
+        },
+    ];
+
+    let tmp = tempfile::NamedTempFile::new()?;
+    let out_path = tmp.path().to_path_buf();
+    // Drop the on-disk file so the first write is a clean create.
+    drop(tmp);
+    assert!(!out_path.exists(), "tempfile should be removed");
+
+    // We can't easily kill `run_loop` mid-iteration from a unit test,
+    // so we use a SnoopingModel that records the file's contents
+    // observed by the test *before* each call returns. After call N
+    // completes, the file already contains N records; we capture
+    // snapshots into a shared vector and assert the monotonicity +
+    // validity invariant.
+    use std::sync::Arc;
+    use std::sync::Mutex;
+
+    #[derive(Default)]
+    struct Snapshots(Mutex<Vec<usize>>);
+
+    struct SnoopingModel {
+        out_path: std::path::PathBuf,
+        snapshots: Arc<Snapshots>,
+    }
+
+    #[async_trait::async_trait]
+    impl e03_placeholder_eval::Model for SnoopingModel {
+        fn name(&self) -> &str {
+            "snoop"
+        }
+        async fn complete(
+            &self,
+            _system: Option<&str>,
+            prompt: &str,
+        ) -> anyhow::Result<e03_placeholder_eval::ModelResponse> {
+            // Right BEFORE the result of this cell gets written, record
+            // the current on-disk record count. After this complete()
+            // returns, run_loop writes the (N+1)th record.
+            let count = match fs::read_to_string(&self.out_path) {
+                Ok(s) => {
+                    // File must already be a valid JSON array at every
+                    // step. If parsing fails here, the write is not
+                    // crash-safe.
+                    let v: serde_json::Value = serde_json::from_str(&s)
+                        .expect("on-disk file must be valid JSON at all times");
+                    v.as_array().expect("must be a JSON array").len()
+                }
+                Err(_) => 0, // file not created yet on the very first call
+            };
+            self.snapshots.0.lock().unwrap().push(count);
+
+            Ok(e03_placeholder_eval::ModelResponse {
+                text: prompt.to_string(),
+                input_tokens: None,
+                output_tokens: None,
+            })
+        }
+    }
+
+    let snapshots = Arc::new(Snapshots::default());
+    let model = SnoopingModel {
+        out_path: out_path.clone(),
+        snapshots: snapshots.clone(),
+    };
+
+    let formats = [PlaceholderFormat::Guillemets];
+    let results = run_loop(&fixtures, &formats, &model, None, &out_path).await?;
+
+    assert_eq!(results.len(), 3, "three cells should have produced three results");
+
+    // Observed counts before each call: 0, 1, 2 — proves the write
+    // happens AFTER each complete(), not just at the end.
+    let observed = snapshots.0.lock().unwrap().clone();
+    assert_eq!(
+        observed,
+        vec![0, 1, 2],
+        "file record count must grow by 1 after each completed cell; \
+         observed {observed:?}"
+    );
+
+    // After the full loop, the on-disk file is a valid JSON array of
+    // exactly 3 records. (run_loop's contract — the same contract a
+    // killed run relies on for its partial output.)
+    let final_text = fs::read_to_string(&out_path)?;
+    let v: serde_json::Value = serde_json::from_str(&final_text)
+        .expect("final on-disk file must be valid JSON");
+    let arr = v.as_array().expect("must be a JSON array");
+    assert_eq!(arr.len(), 3, "final file has 3 records");
+    // Records are full EvalResult shapes (sanity check on one field).
+    assert_eq!(arr[0]["fixture_name"], "fx-a");
+    assert_eq!(arr[1]["fixture_name"], "fx-b");
+    assert_eq!(arr[2]["fixture_name"], "fx-c");
+
+    fs::remove_file(&out_path).ok();
     Ok(())
 }
 

@@ -31,6 +31,14 @@ cargo run --release -- \
     --out results.json
 ```
 
+Add `--instructions <FILE>` to prepend a UTF-8 text file as a system
+prompt on every call (the build-plan §9 option (a) experiment — "what
+if we tell the model to preserve `«...»` tokens verbatim?"). Omit the
+flag for the zero-shot baseline.
+
+The output JSON is refreshed after every cell, so a kill mid-run leaves
+a valid array of however many cells completed.
+
 ## Success criteria
 
 - ✅ At least one placeholder format achieves ≥98% verbatim preservation on prefix-typed secrets across all tested models.

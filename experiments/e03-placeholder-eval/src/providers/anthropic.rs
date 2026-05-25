@@ -50,13 +50,23 @@ impl Model for AnthropicProvider {
         &self.name
     }
 
-    async fn complete(&self, prompt: &str) -> Result<ModelResponse> {
-        let body = json!({
+    async fn complete(&self, system: Option<&str>, prompt: &str) -> Result<ModelResponse> {
+        // Anthropic's Messages API puts the system prompt at the TOP LEVEL
+        // of the request body, NOT as a `role: "system"` entry inside the
+        // `messages` array — the messages array only carries `user` and
+        // `assistant` turns. Verified against the Messages API reference
+        // (top-level optional `system` parameter alongside `messages`).
+        // When `system` is `None` we omit the field so the body is
+        // byte-identical to the zero-shot baseline.
+        let mut body = json!({
             "model": self.model_id,
             "max_tokens": self.max_tokens,
             "messages": [{"role": "user", "content": prompt}],
             "stream": false,
         });
+        if let Some(sys) = system {
+            body["system"] = json!(sys);
+        }
 
         let url = format!("{}/v1/messages", self.base_url);
         let resp = self

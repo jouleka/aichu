@@ -16,8 +16,9 @@ use anyhow::{Context, Result};
 use clap::Parser;
 
 use e03_placeholder_eval::{
-    PlaceholderFormat, evaluate, load_fixtures, model::Model,
+    PlaceholderFormat, load_fixtures, model::Model,
     providers::{anthropic::AnthropicProvider, openai::OpenAiProvider},
+    run_loop,
 };
 
 #[derive(Debug, Parser)]
@@ -40,7 +41,14 @@ struct Args {
     #[arg(long, default_value = "all")]
     formats: String,
 
-    /// Output JSON path.
+    /// Optional path to a UTF-8 text file whose contents are sent as a
+    /// system-prompt prefix on every call. Omit for the zero-shot
+    /// baseline (build-plan §9 option (a) is the targeted experiment).
+    #[arg(long)]
+    instructions: Option<PathBuf>,
+
+    /// Output JSON path. Refreshed after every cell — a kill mid-run
+    /// leaves a valid JSON array of however many cells completed.
     #[arg(long)]
     out: PathBuf,
 }
@@ -61,6 +69,14 @@ async fn main() -> Result<()> {
         anyhow::bail!("no .txt fixtures found in {}", args.prompts.display());
     }
 
+    let instructions = match &args.instructions {
+        Some(p) => Some(
+            fs::read_to_string(p)
+                .with_context(|| format!("read --instructions file {}", p.display()))?,
+        ),
+        None => None,
+    };
+
     let model: Box<dyn Model> = match args.provider.as_str() {
         "anthropic" => {
             let api_key = std::env::var("ANTHROPIC_API_KEY")
@@ -75,31 +91,15 @@ async fn main() -> Result<()> {
         other => anyhow::bail!("unknown provider {other:?}; supported: anthropic, openai"),
     };
 
-    let mut results = Vec::with_capacity(fixtures.len() * formats.len());
-    for (idx, fixture) in fixtures.iter().enumerate() {
-        for format in &formats {
-            tracing::info!(
-                fixture = %fixture.name,
-                format = %format,
-                "evaluating"
-            );
-            let n = idx + 1;
-            let r = evaluate(
-                &fixture.name,
-                &fixture.text,
-                &fixture.secret_text,
-                &fixture.secret_type,
-                *format,
-                n,
-                model.as_ref(),
-            )
-            .await?;
-            results.push(r);
-        }
-    }
+    let results = run_loop(
+        &fixtures,
+        &formats,
+        model.as_ref(),
+        instructions.as_deref(),
+        &args.out,
+    )
+    .await?;
 
-    let json = serde_json::to_string_pretty(&results)?;
-    fs::write(&args.out, json).with_context(|| format!("write {}", args.out.display()))?;
     tracing::info!(out = %args.out.display(), n = results.len(), "wrote results");
     Ok(())
 }

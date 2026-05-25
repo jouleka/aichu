@@ -1,6 +1,14 @@
 // The `Model` trait abstracts over real frontier-model providers and
-// in-process mocks. The eval harness only needs `complete(prompt) -> text`
-// + a name. Streaming is not needed (we want the full response to scan).
+// in-process mocks. The eval harness only needs `complete(system?, prompt)
+// -> text` + a name. Streaming is not needed (we want the full response to
+// scan).
+//
+// `system` is `Option<&str>`: when `None`, the request is byte-identical to
+// today's prompt-only call (the zero-shot baseline); when `Some`, the
+// provider attaches it per its API's system-message convention (top-level
+// `system` for Anthropic, a `role: "system"` entry for OpenAI's
+// chat-completions). This is the hook for build-plan §9 option (a):
+// "what if we tell the model to preserve `«...»` tokens?".
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -15,7 +23,7 @@ pub struct ModelResponse {
 #[async_trait]
 pub trait Model: Send + Sync {
     fn name(&self) -> &str;
-    async fn complete(&self, prompt: &str) -> Result<ModelResponse>;
+    async fn complete(&self, system: Option<&str>, prompt: &str) -> Result<ModelResponse>;
 }
 
 /// Best-effort refusal detection. Heuristic only — false positives mean
@@ -95,6 +103,11 @@ pub fn looks_like_refusal(text: &str) -> bool {
 /// A model that returns the prompt verbatim. Useful for testing that
 /// `evaluate()` reports `preserved=true` when the placeholder is present
 /// in the response.
+///
+/// The `system` argument is intentionally ignored: the echo invariant we
+/// rely on in tests is "if the user prompt contains the placeholder
+/// verbatim, the response contains it verbatim". Echoing the system
+/// message too would conflate `preserved` with system-message presence.
 pub struct EchoModel;
 
 #[async_trait]
@@ -102,7 +115,7 @@ impl Model for EchoModel {
     fn name(&self) -> &str {
         "echo"
     }
-    async fn complete(&self, prompt: &str) -> Result<ModelResponse> {
+    async fn complete(&self, _system: Option<&str>, prompt: &str) -> Result<ModelResponse> {
         Ok(ModelResponse {
             text: prompt.to_string(),
             input_tokens: Some(prompt.len() as u32 / 4), // rough estimate
@@ -123,7 +136,7 @@ impl Model for StaticModel {
     fn name(&self) -> &str {
         &self.name
     }
-    async fn complete(&self, _prompt: &str) -> Result<ModelResponse> {
+    async fn complete(&self, _system: Option<&str>, _prompt: &str) -> Result<ModelResponse> {
         Ok(ModelResponse {
             text: self.response.clone(),
             input_tokens: None,
@@ -182,8 +195,29 @@ mod tests {
     #[tokio::test]
     async fn echo_model_returns_prompt_verbatim() {
         let m = EchoModel;
-        let r = m.complete("hello \u{ab}SECRET_GENERIC_001\u{bb} world").await.unwrap();
+        let r = m
+            .complete(None, "hello \u{ab}SECRET_GENERIC_001\u{bb} world")
+            .await
+            .unwrap();
         assert_eq!(r.text, "hello \u{ab}SECRET_GENERIC_001\u{bb} world");
+    }
+
+    #[tokio::test]
+    async fn echo_model_ignores_system_message() {
+        // The echo mock must NOT mix the system message into its response.
+        // If it did, `preserved` would become "placeholder present in
+        // system OR user prompt", which would silently invalidate the
+        // `--instructions`-injected runs (the instruction itself is
+        // expected to mention the placeholder shape verbatim).
+        let m = EchoModel;
+        let r = m
+            .complete(
+                Some("Preserve \u{ab}SECRET\u{bb} tokens verbatim."),
+                "user prompt only",
+            )
+            .await
+            .unwrap();
+        assert_eq!(r.text, "user prompt only");
     }
 
     #[tokio::test]
@@ -192,7 +226,7 @@ mod tests {
             name: "static".into(),
             response: "fixed".into(),
         };
-        let r = m.complete("anything").await.unwrap();
+        let r = m.complete(None, "anything").await.unwrap();
         assert_eq!(r.text, "fixed");
     }
 }
