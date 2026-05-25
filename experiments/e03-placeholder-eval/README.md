@@ -87,24 +87,71 @@ These will be added as we run the eval. Do not include real secrets — use vend
   (`content[].text` + `usage.{input,output}_tokens`). No real API budget
   burned.
 
-### Manual (real Anthropic run)
+### Manual (real-API runs)
 
-> **Status: deferred.** Harness is wired and tested end-to-end against a
-> mock Anthropic server. Real-API run is gated on Anthropic Console
-> credits; documented below as a follow-up. When ready:
->
-> ```bash
-> export ANTHROPIC_API_KEY=sk-ant-...
-> cargo run --release -p e03-placeholder-eval -- \
->     --prompts experiments/e03-placeholder-eval/prompts/ \
->     --provider anthropic \
->     --model claude-opus-4-5 \
->     --formats all \
->     --out e03-results.json
-> ```
->
-> Estimated cost: 50 fixtures × 6 formats = 300 calls × ~$0.02/call on
-> Opus 4.5 ≈ **$5–6 total**. Sonnet 4.5/Haiku are ~10× cheaper.
+#### openai:gpt-5-mini — 2026-05-25 (300 calls, ~$0.50)
+
+Full results: [`results/gpt-5-mini-2026-05-25.json`](results/gpt-5-mini-2026-05-25.json).
+
+| Format | Preserved | Rate | Notes |
+|---|---|---|---|
+| `{{VAR}}` (mustache) | 20 / 50 | **40.0%** | best typed format |
+| `__SECRET_TYPE_NNN__` (underscore_type) | 12 / 50 | 24.0% | |
+| `<SECRET_N>` (angle_num) | 10 / 50 | 20.0% | |
+| `«SECRET_TYPE_NNN»` (guillemets) | 6 / 50 | **12.0%** | current production format |
+| `[REDACTED]` | 6 / 50 | 12.0% | substring-biased negative control |
+| `***` (asterisks) | 10 / 50 | 20.0% | substring-biased negative control |
+
+Refusals: 0 / 300. Avg latency: ~8.5 s / call (gpt-5-mini with
+`reasoning_effort=minimal`). Total output: ~243k tokens.
+
+**No format clears the §9 kill threshold of 95% preservation
+zero-shot on gpt-5-mini.** Two things matter for interpreting this:
+
+1. **The security property still holds.** The proxy strips the
+   secret BEFORE the request leaves the machine. The original
+   secret never reaches the model. A low preservation rate means
+   the response-side reversal has nothing to substitute, NOT that
+   the secret leaked.
+2. **The UX property degrades.** gpt-5-mini paraphrases more often
+   than it echoes — it answers the user's underlying question
+   ("your AWS key is the problem, use an IAM role instead")
+   without quoting the placeholder. The user gets a useful
+   answer that just doesn't pretend to know the original secret.
+
+Build-plan §9's fallback for this outcome is option (a): add a
+system-prompt instruction telling the model to preserve `«...»`
+tokens verbatim. That variant of the eval has NOT been run yet —
+it's the cheapest next experiment.
+
+Reproduce:
+
+```bash
+export OPENAI_API_KEY=sk-...
+cargo run --release -p e03-placeholder-eval -- \
+    --prompts experiments/e03-placeholder-eval/prompts/ \
+    --provider openai \
+    --model gpt-5-mini \
+    --formats all \
+    --out fresh-results.json
+```
+
+#### anthropic — deferred
+
+Same harness, gated on Anthropic Console credits. When ready:
+
+```bash
+export ANTHROPIC_API_KEY=sk-ant-...
+cargo run --release -p e03-placeholder-eval -- \
+    --prompts experiments/e03-placeholder-eval/prompts/ \
+    --provider anthropic \
+    --model claude-opus-4-5 \
+    --formats all \
+    --out results/anthropic-opus-4-5-YYYY-MM-DD.json
+```
+
+Estimated cost: 300 × ~$0.02/call on Opus 4.5 ≈ **$5–6**.
+Sonnet 4.5 / Haiku are ~10× cheaper.
 
 ### Research-based justification for the placeholder design (2026-05-16)
 
@@ -150,22 +197,31 @@ trivially extensible.
 
 ### Risk 2 verdict
 
-**Conditionally validated.** The placeholder design follows the
-academic state-of-the-art's published rationale. The harness is
-empirically wired (14 automated tests, including round-trip against a
-local axum mock pretending to be Anthropic). The actual cross-format
-preservation rates on live Anthropic / OpenAI / Google traffic remain
-the one missing piece, deferred to a budget-gated follow-up.
+**First-pass measurement complete (gpt-5-mini); falsified on
+zero-shot preservation but security property intact.** No format
+clears the §9 95% threshold on gpt-5-mini without an explicit
+preserve-instruction prompt prefix. The security property of "the
+secret never leaves the machine" is unaffected by preservation
+rate; only the UX property of "the response looks like it knew
+about the redaction" degrades.
 
-The decision to move forward to `crates/proxy-core` rests on:
-1. Convergence with the arxiv state-of-the-art (rare-Unicode-bracket
-   design principle) — qualitative signal.
-2. Build-plan §7's qualitative testing (favored guillemets) —
-   qualitative signal.
-3. Competitor product (`WangYihang/llm-redactor`) shipping with
-   the *known-bad* `[REDACTED]` format — implies our floor is no
-   worse than theirs.
-4. The harness can run in 10 minutes whenever budget exists.
+Updated guidance:
+
+1. **Ship the proxy as-is for the security property.** Reversal is
+   a UX nicety; absence of reversal is not a security failure.
+2. **Investigate option (a) next** — a system-prompt instruction
+   telling the model to preserve `«...»` tokens — before
+   committing to a different placeholder format. The smallest
+   experiment that might move the rate from 12% to 90%+ on the
+   current format.
+3. **Cross-family measurements (Anthropic, Google) still needed**
+   to know whether gpt-5-mini's paraphrase tendency is
+   model-family-specific. Each one is one cargo invocation away.
+4. **The arxiv-paper-cited "rare-Unicode-bracket" design principle
+   did not yield a preservation advantage on gpt-5-mini.**
+   Guillemets (12%) and angle brackets (20%) both underperformed
+   mustache (40%). The qualitative convergence with prior art does
+   not survive measurement.
 
 ### What this commit ships and deliberately omits
 
@@ -179,10 +235,21 @@ The decision to move forward to `crates/proxy-core` rests on:
 - JSON output schema (`EvalResult` is `Serialize`)
 
 **Out of scope (follow-ups):**
-- OpenAI provider — same recipe as Anthropic; add when needed
 - Gemini / Google provider
-- The 50-fixture corpus from the build-plan suggestions
-- Actually running the eval against real APIs — gated on your API budget
+- System-prompt-instructed variant of the eval (build-plan §9
+  option (a)) — the cheapest next experiment given the gpt-5-mini
+  results
+- Anthropic real-API run (Opus / Sonnet) — would give us the
+  cross-family picture
+- Larger fixture corpus (the 50 we have are a starting point, not
+  a statistical sample)
+
+**Shipped since v0.1:**
+- OpenAI provider (commit 2afff40 + 91e33cd; runs against
+  gpt-5-mini and other reasoning-capable models via
+  `reasoning_effort=minimal`)
+- First measured real-API run (commit 26acf3d; gpt-5-mini,
+  300 calls, results above)
 
 ### Known measurement caveats (recorded for the results writeup)
 

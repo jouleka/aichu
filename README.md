@@ -128,28 +128,43 @@ not adversarial.
   to your filesystem; if it wants your `.env`, it can `cat` it directly
   rather than embed it in a prompt. aichu sits in the network path, not the
   filesystem path.
-- **Secrets in formats we don't detect.** v0 covers 9 patterns:
+- **Secrets in formats we don't detect.** v0 covers 12 patterns:
   Anthropic, OpenAI, AWS access key, GitHub PAT, Stripe live key, JWT,
   Slack token, AWS secret access key (identifier-anchored + entropy
-  gate), PEM private-key blocks (multi-line, RSA/EC/PKCS#8/OpenSSH/DSA).
-  Custom tokens with no distinctive prefix and no surrounding identifier
-  are NOT redacted. See "Known limitations" below.
+  gate), PEM private-key blocks (multi-line, RSA/EC/PKCS#8/OpenSSH/DSA),
+  GCP service-account JSON, Twilio API-key SID + auth token,
+  Cloudflare API token (identifier-anchored). Custom tokens with no
+  distinctive prefix and no surrounding identifier are NOT redacted.
+  See "Known limitations" below.
 - **Model paraphrase / drop of placeholders.** When the model preserves
   `«SECRET_AWS_KEY_001»` verbatim in its response, we reverse it back to
   the original secret. When the model paraphrases ("your AWS key"), there
-  is nothing to substitute and the user sees the placeholder gone from the
-  response. Build-plan §7 and the prior-art writeup in
-  [`experiments/e03-placeholder-eval/README.md`](experiments/e03-placeholder-eval/README.md)
-  argue qualitatively that rare-Unicode-bracket placeholders preserve well
-  (the academic state-of-the-art —
-  [LLM-Redactor, arxiv 2604.12064](https://arxiv.org/abs/2604.12064) —
-  converged on the same design principle). The full
-  per-format-per-model preservation matrix has NOT been measured: the
-  e03 harness is wired and tested against an axum mock, but the real-API
-  run is deferred until Anthropic Console credits are available.
-  Manually we have observed the round-trip working on a handful of prompts
-  against real Anthropic through both modes; that is empirical existence
-  proof, not a statistical preservation rate.
+  is nothing to substitute and the user sees the placeholder gone from
+  the response. **First measurement (2026-05-25, openai:gpt-5-mini,
+  50 fixtures × 6 formats = 300 calls, zero-shot, no instruction prefix,
+  results at [`experiments/e03-placeholder-eval/results/gpt-5-mini-2026-05-25.json`](experiments/e03-placeholder-eval/results/gpt-5-mini-2026-05-25.json)):**
+
+  | Format | Preservation rate | Notes |
+  |---|---|---|
+  | `{{VAR}}` (mustache) | **40%** | best typed format on this model |
+  | `__SECRET_TYPE_NNN__` (underscore_type) | 24% | |
+  | `<SECRET_N>` (angle_num) | 20% | |
+  | `«SECRET_TYPE_NNN»` (guillemets) | **12%** | current production format |
+  | `[REDACTED]` / `***` | 12% / 20% | substring-biased negative controls |
+
+  Refusals: 0 / 300. The safety-refusal mode build-plan §7 worried
+  about does not appear on gpt-5-mini. **None of the formats clear
+  build-plan §9's 95% preservation threshold zero-shot.** This does
+  NOT mean secrets leak — the proxy strips them BEFORE the request
+  leaves the machine; the original secret never reaches the model.
+  It DOES mean the response-side reversal often has nothing to
+  substitute, because gpt-5-mini paraphrases ("your AWS key is the
+  problem...") instead of echoing the placeholder. The user gets a
+  useful answer with no original secret in it — the **security
+  property holds**; the **UX property of "the response looks like
+  it never knew about the redaction" does not**. Cross-family
+  measurements (Anthropic, Google) and a system-prompt-instructed
+  variant of this eval remain follow-up work.
 - **Traffic outside the proxy.** DNS lookups, ICMP, anything not routed
   through `HTTPS_PROXY` / base URL config. The proxy only sees what the
   agent CHOOSES to route through it.
@@ -208,33 +223,20 @@ suspect exposure.
 
 ### Known limitations (v0)
 
-- **HTTP/2 multiplexing.** Mode B keys the per-request PlaceholderMap
-  by `client_addr`. HTTP/2 multiplexed streams share a TCP connection
-  (and thus a `client_addr`), so two truly concurrent requests on one
-  connection could race. Not observed in practice; documented in
-  `crates/proxy-mitm/src/handler.rs`.
-- **Orphaned-entry cleanup is sweep-based, not push-based.** If
-  `handle_response` never runs (TLS error, client cancellation,
-  upstream timeout), the HashMap entry for that `client_addr` would
-  otherwise linger forever. v0 evicts entries older than 15 minutes
-  via an opportunistic sweep on every prompt-endpoint request
-  (`crates/proxy-mitm/src/handler.rs::sweep_stale`). Worst-case
-  memory: roughly `request_rate × orphan_rate × 15 min` entries at a
-  few KB each. For a localhost single-user proxy that's typically
-  zero; under sustained pathological churn it could reach the low
-  thousands transiently before the next sweep — single-digit MB at
-  most.
-- **Pattern coverage growing.** The 9 v0 patterns cover the most
-  common secret shapes that appear in pasted `.env` files and code
-  snippets, but the universe of secrets is broader — custom HMAC
-  signatures, GCP service-account JSONs, Twilio auth tokens,
-  Cloudflare API tokens, etc. are not yet covered. The architecture
-  scales (one new variant + regex + dedicated detection tests per
-  pattern); coverage expansion is a future-work axis, not a v0
-  ship-blocker.
-- **Manual eval not yet run.** The e03 harness can measure placeholder
-  preservation rates across model families. The real-API run is gated
-  on Anthropic Console credits and remains a deferred work item.
+- **Pattern coverage growing.** The 12 v0 patterns cover the most
+  common secret shapes in pasted `.env` files and code snippets, but
+  the universe of secrets is broader — custom HMAC signatures,
+  database connection strings with embedded credentials, generic
+  bearer tokens with no surrounding identifier, etc. are not yet
+  covered. The architecture scales (one new variant + regex +
+  dedicated detection tests per pattern); coverage expansion is a
+  future-work axis, not a v0 ship-blocker.
+- **Cross-family eval still partial.** First measured run lives at
+  [`experiments/e03-placeholder-eval/results/gpt-5-mini-2026-05-25.json`](experiments/e03-placeholder-eval/results/gpt-5-mini-2026-05-25.json)
+  (300 calls × gpt-5-mini, summarized under "Model paraphrase" above).
+  Anthropic / Google preservation rates and a system-prompt-instructed
+  variant remain deferred — each is one cargo invocation away once
+  budget exists.
 
 ### Audit-friendly invariants
 
