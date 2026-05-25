@@ -5,10 +5,13 @@
 # Cargo.lock IS committed (we ship binaries); only ignore backups.
 Cargo.lock.bak
 
-# IDE
+# IDE / per-tool workspace
 .idea/
 .vscode/
 *.iml
+.claude/
+.cursor/
+.aider*
 
 # macOS
 .DS_Store
