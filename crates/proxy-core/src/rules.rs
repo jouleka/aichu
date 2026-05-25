@@ -40,6 +40,49 @@ pub enum SecretKind {
     /// Public keys, certificates, and certificate requests are NOT
     /// matched — only blocks whose label ends in `PRIVATE KEY`.
     PemPrivateKey,
+    /// GCP service-account JSON blob. The whole `{...}` envelope is
+    /// the secret — `"type":"service_account"` is the discriminator,
+    /// and the embedded `private_key` PEM is INSIDE the redacted
+    /// region rather than getting its own placeholder.
+    ///
+    /// Precedence over `PemPrivateKey` (the inner PEM): the overlap
+    /// resolver in `detector::scan` keeps the longest match, and the
+    /// JSON envelope is always longer than the PEM it contains, so
+    /// GCP wins automatically. Pinned by the
+    /// `gcp_service_account_wins_over_inner_pem_match` test.
+    ///
+    /// Rationale: the JSON envelope carries identifying metadata
+    /// (`client_email`, `project_id`, `private_key_id`) that itself
+    /// leaks project identity even if the inner PEM were redacted on
+    /// its own. One placeholder over the whole blob is cleaner than
+    /// a JSON envelope with a nested `«SECRET_PEM_KEY_001»` in the
+    /// middle.
+    GcpServiceAccountJson,
+    /// Twilio credentials. Covers two distinct shapes via regex
+    /// alternation:
+    ///
+    /// 1. **API key SID** — `SK` + 32 hex chars (34 total). The half
+    ///    of the credential pair that identifies the key, paired
+    ///    with a separately-stored secret. Twilio's Account SID
+    ///    (`AC` + 32 hex) is intentionally NOT matched: it's a
+    ///    tenant identifier, not a secret on its own (per Twilio
+    ///    docs it appears as a Basic-auth username alongside the
+    ///    real password). See the `twilio_account_sid_is_not_a_secret`
+    ///    test for the WHY.
+    ///
+    /// 2. **Auth token** — 32 hex chars with no distinctive prefix.
+    ///    Anchored to `twilio_auth_token=` (case-insensitive,
+    ///    `\b`-bounded) like AWS_SECRET — bare 32-hex elsewhere
+    ///    (MD5 hashes, request IDs) is too noisy to flag without
+    ///    the identifier.
+    TwilioAuthToken,
+    /// Cloudflare API tokens. Opaque ~40-char URL-safe alphanumeric
+    /// strings with no fixed prefix. Identifier-anchored to
+    /// `cloudflare_api_token=` / `cf_api_token=` / `cf_token=`
+    /// (`\b`-bounded, case-insensitive) plus an entropy gate — same
+    /// shape as AWS_SECRET. Without anchoring, a bare 40-char
+    /// alphanumeric is too generic to classify with confidence.
+    CloudflareApiToken,
 }
 
 impl SecretKind {
@@ -56,6 +99,9 @@ impl SecretKind {
         SecretKind::SlackToken,
         SecretKind::AwsSecretAccessKey,
         SecretKind::PemPrivateKey,
+        SecretKind::GcpServiceAccountJson,
+        SecretKind::TwilioAuthToken,
+        SecretKind::CloudflareApiToken,
     ];
 
     /// Keywords the aho-corasick pre-filter scans for. If `input` does
@@ -91,6 +137,43 @@ impl SecretKind {
             // PEM blocks always start with this exact 11-byte sequence;
             // the regex then narrows to PRIVATE KEY labels only.
             SecretKind::PemPrivateKey => &["-----BEGIN"],
+            // `service_account` is the discriminator substring that
+            // appears in EVERY GCP service-account JSON regardless of
+            // whitespace formatting — both the canonical no-space
+            // encoding (`"type":"service_account"`) and the pretty-
+            // printed form `jq` and most JSON formatters emit
+            // (`"type": "service_account"` with a space after the
+            // colon) contain it. The regex tolerates optional
+            // whitespace around the colon and asserts the wider
+            // discriminator; the prefilter only needs to be a
+            // substring of every accepted match. Pinned by
+            // `gcp_detects_pretty_printed_service_account` and by
+            // the `prefilter_keywords_are_prefixes_of_regex_matches`
+            // invariant.
+            SecretKind::GcpServiceAccountJson => &["service_account"],
+            // `SK` catches the API-key SID shape (uppercase only —
+            // Twilio docs document SIDs as `SK` uppercase + lowercase
+            // hex, and the regex's SK arm is case-sensitive to match);
+            // `twilio_auth_token` / `TWILIO_AUTH_TOKEN` catches the
+            // unprefixed-32-hex auth token when it appears with its
+            // standard identifier. The regex's auth-token arm is
+            // `(?i)`-wrapped so a mixed-case `Twilio_Auth_Token`
+            // identifier still matches if the prefilter trips on one
+            // of the cased forms.
+            SecretKind::TwilioAuthToken => {
+                &["SK", "twilio_auth_token", "TWILIO_AUTH_TOKEN"]
+            }
+            // Cloudflare tokens have no provider-side prefix; we trip
+            // the prefilter on the env-var identifiers users commonly
+            // assign them to (lowercase Python / uppercase .env both).
+            SecretKind::CloudflareApiToken => &[
+                "cloudflare_api_token",
+                "CLOUDFLARE_API_TOKEN",
+                "cf_api_token",
+                "CF_API_TOKEN",
+                "cf_token",
+                "CF_TOKEN",
+            ],
         }
     }
 
@@ -167,15 +250,87 @@ impl SecretKind {
             SecretKind::PemPrivateKey => {
                 r"(?s)-----BEGIN (?:[A-Z][A-Z0-9 ]*? )?PRIVATE KEY-----.*?-----END (?:[A-Z][A-Z0-9 ]*? )?PRIVATE KEY-----"
             }
+            // GCP service-account JSON. `(?s)` enables dotall so the
+            // body — including the embedded `private_key` PEM whose
+            // newlines survive as literal `\n` escapes inside a JSON
+            // string — is matched as one object. `\{[^{}]*?...\}`
+            // anchors to a single non-nested object: real
+            // service-account JSON is flat (no nested objects) and
+            // its string values never contain `{` or `}`, so this
+            // both keeps the regex simple and prevents engulfing
+            // surrounding text. Discriminator: `"type"` + optional
+            // whitespace + `:` + optional whitespace +
+            // `"service_account"`. The `\s*` around the colon
+            // tolerates the spacing that `jq` and most JSON pretty-
+            // printers insert (e.g., `"type": "service_account"`);
+            // users routinely `cat key.json | jq` before pasting,
+            // and the canonical no-space form is just one of the
+            // shapes we have to accept.
+            SecretKind::GcpServiceAccountJson => {
+                r#"(?s)\{[^{}]*?"type"\s*:\s*"service_account"[^{}]*?\}"#
+            }
+            // Twilio: alternation of the prefix-typed API-key SID
+            // (`SK` + 32 hex) AND the identifier-anchored auth token
+            // (32 hex). Both alternation arms expose the secret via
+            // a capture group — group 1 = SK SID, group 2 = auth
+            // token. `secret_capture_groups` lists both so the
+            // detector picks the participating one per match.
+            //
+            // `\b` on the auth-token identifier prevents
+            // `not_twilio_auth_token=...` matches, same lever as
+            // AWS_SECRET. `\b` on the SK branch prevents
+            // false-matching a substring of a longer alphanumeric
+            // run like `prefixSKabcdef...`.
+            //
+            // Case-sensitivity: `(?i)` is applied ONLY to the
+            // identifier-anchored auth-token arm via an inline
+            // `(?i:...)` group, so env-var name spellings like
+            // `Twilio_Auth_Token` still match. The SK arm is left
+            // case-sensitive on purpose — Twilio documents SIDs as
+            // `SK` (uppercase) + lowercase hex, and the prefilter
+            // keyword `SK` is uppercase-only. Without this split,
+            // a lowercase `sk` + 32 hex value (which looks like an
+            // OpenAI legacy key prefix or arbitrary hex) would
+            // false-positive whenever some OTHER kind's prefilter
+            // keyword (e.g., `AKIA`) put us past the global gate.
+            // Pinned by `twilio_sk_prefix_must_be_uppercase`.
+            SecretKind::TwilioAuthToken => {
+                r#"(?:\b(SK[0-9a-f]{32})\b|(?i:\btwilio_auth_token[\s"':=]+)([0-9a-f]{32})\b)"#
+            }
+            // Cloudflare: identifier-anchored secret with entropy gate.
+            // `\b` prevents `not_cloudflare_api_token=...` from
+            // matching, same lever as AWS_SECRET. The accepted
+            // alphabet is URL-safe `[A-Za-z0-9_-]` — Cloudflare
+            // documents tokens as URL-safe. `{30,80}` brackets the
+            // documented ~40-char length: a range so a future format
+            // bump doesn't silently drop detection, but bounded so
+            // the regex doesn't engulf long alphanumeric prose.
+            SecretKind::CloudflareApiToken => {
+                r#"(?i)\b(?:cloudflare_api_token|cf_api_token|cf_token)[\s"':=]+([A-Za-z0-9_-]{30,80})"#
+            }
         }
     }
 
-    /// Which capture group of `regex()` is the actual secret to redact.
-    /// Default 0 (the whole match). Identifier-anchored kinds use 1.
-    pub fn secret_capture_group(&self) -> usize {
+    /// Which capture group(s) of `regex()` carry the actual secret to
+    /// redact. Default `&[0]` (the whole match). Identifier-anchored
+    /// kinds use `&[1]`. Kinds whose regex has multiple alternation
+    /// arms, each with its own capture group, list all of them; the
+    /// detector picks the first group that participated in the
+    /// current match.
+    pub fn secret_capture_groups(&self) -> &'static [usize] {
         match self {
-            SecretKind::AwsSecretAccessKey => 1,
-            _ => 0,
+            SecretKind::AwsSecretAccessKey => &[1],
+            // Cloudflare is always identifier-anchored — group 1 is
+            // the token, group 0 includes the identifier prefix we
+            // do NOT want to redact (the user's `.env` line should
+            // keep `CLOUDFLARE_API_TOKEN=` and only swap the value).
+            SecretKind::CloudflareApiToken => &[1],
+            // Twilio's two-arm alternation: group 1 = SK API-key SID
+            // (prefix-typed), group 2 = identifier-anchored auth
+            // token. Exactly one is populated per match; the detector
+            // picks the participating group.
+            SecretKind::TwilioAuthToken => &[1, 2],
+            _ => &[0],
         }
     }
 
@@ -208,6 +363,18 @@ impl SecretKind {
     pub fn min_entropy(&self) -> Option<f64> {
         match self {
             SecretKind::AwsSecretAccessKey => Some(3.5),
+            // Cloudflare tokens are random URL-safe alphanum (alphabet
+            // ~64 chars, ~6 bits/char); real ones score >4. The 3.5
+            // threshold matches AWS_SECRET's choice for the same
+            // reason — see that variant's doc comment.
+            SecretKind::CloudflareApiToken => Some(3.5),
+            // Twilio: NO entropy gate. The SK arm is prefix-typed
+            // (`SK` + 32 hex), high enough confidence on its own.
+            // The auth-token arm is identifier-anchored AND its
+            // alphabet is restricted to hex `[0-9a-f]{32}` — max
+            // possible entropy on hex is 4.0 bits/char, and any
+            // collision with `twilio_auth_token=...` on a 32-hex
+            // value is already a near-certain real secret.
             _ => None,
         }
     }
@@ -226,6 +393,9 @@ impl SecretKind {
             SecretKind::SlackToken => "SLACK_TOKEN",
             SecretKind::AwsSecretAccessKey => "AWS_SECRET",
             SecretKind::PemPrivateKey => "PEM_KEY",
+            SecretKind::GcpServiceAccountJson => "GCP_SA_JSON",
+            SecretKind::TwilioAuthToken => "TWILIO_TOKEN",
+            SecretKind::CloudflareApiToken => "CLOUDFLARE_TOKEN",
         }
     }
 }
@@ -320,6 +490,32 @@ mod tests {
                     "-----BEGIN RSA PRIVATE KEY-----\nMIIE\n-----END RSA PRIVATE KEY-----".to_string(),
                     "-----BEGIN PRIVATE KEY-----\nMIIE\n-----END PRIVATE KEY-----".to_string(),
                     "-----BEGIN OPENSSH PRIVATE KEY-----\nb3Bl\n-----END OPENSSH PRIVATE KEY-----".to_string(),
+                ],
+            ),
+            (
+                SecretKind::GcpServiceAccountJson,
+                &[
+                    r#"{"type":"service_account","project_id":"p"}"#.to_string(),
+                    // Pretty-printed `jq`-style — the prefilter
+                    // keyword (`service_account`) must be a substring
+                    // of THIS too, otherwise pretty-printed keys
+                    // would never make it past the prefilter.
+                    r#"{"type": "service_account", "project_id":"p"}"#.to_string(),
+                ],
+            ),
+            (
+                SecretKind::TwilioAuthToken,
+                &[
+                    format!("SK{}", "a".repeat(32)),
+                    format!("TWILIO_AUTH_TOKEN={}", "b".repeat(32)),
+                ],
+            ),
+            (
+                SecretKind::CloudflareApiToken,
+                &[
+                    format!("CLOUDFLARE_API_TOKEN={}", "a".repeat(40)),
+                    format!("CF_API_TOKEN={}", "b".repeat(40)),
+                    format!("cf_token=\"{}\"", "c".repeat(40)),
                 ],
             ),
         ];

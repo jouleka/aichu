@@ -135,3 +135,92 @@ fn redact_handles_byte_offsets_in_utf8_text_correctly() {
     let response = "\u{ab}SECRET_AWS_KEY_001\u{bb} — это твой ключ.";
     assert_eq!(reverse(response, &map), "AKIAIOSFODNN7EXAMPLE — это твой ключ.");
 }
+
+#[test]
+fn round_trip_recovers_gcp_service_account_json_blob() {
+    // The whole envelope round-trips intact — header, embedded PEM,
+    // and metadata all return verbatim. Pins the WHY of GCP's
+    // wins-over-PEM precedence: a single placeholder covers the
+    // whole blob, so reverse() restores the entire JSON as the
+    // user originally pasted it.
+    let blob = r#"{"type":"service_account","project_id":"my-proj","private_key":"-----BEGIN PRIVATE KEY-----\nMIIEvQ\n-----END PRIVATE KEY-----\n","client_email":"sa@my-proj.iam.gserviceaccount.com"}"#;
+    let prompt = format!("Deploy with this key: {blob}\nThen run.");
+    let mut map = PlaceholderMap::new();
+    let redacted = redact(&prompt, &mut map);
+    assert_eq!(map.len(), 1, "expected one placeholder for the GCP blob, got {}", map.len());
+    assert!(
+        redacted.contains("\u{ab}SECRET_GCP_SA_JSON_001\u{bb}"),
+        "missing GCP placeholder: {redacted:?}",
+    );
+    // Critical: the redacted text must NOT contain the inner PEM
+    // markers either — the GCP envelope swallowed them.
+    assert!(
+        !redacted.contains("-----BEGIN PRIVATE KEY-----"),
+        "inner PEM leaked through GCP envelope redaction: {redacted:?}",
+    );
+
+    let response = "Use \u{ab}SECRET_GCP_SA_JSON_001\u{bb} for deploys.";
+    let restored = reverse(response, &map);
+    assert!(
+        restored.contains(blob),
+        "round-trip dropped the GCP blob: {restored:?}",
+    );
+}
+
+#[test]
+fn round_trip_recovers_twilio_api_key_sid() {
+    // Prefix-typed (`SK` + 32 hex) — whole match is the secret.
+    // Pins that the TwilioAuthToken kind's two-arm regex restores
+    // correctly when the SK branch fires.
+    let sid = format!("SK{}", "0123456789abcdef".repeat(2));
+    let prompt = format!("My TWILIO_API_KEY_SID={sid} is rejected.");
+    let mut map = PlaceholderMap::new();
+    let redacted = redact(&prompt, &mut map);
+    assert_eq!(map.len(), 1);
+    assert!(redacted.contains("\u{ab}SECRET_TWILIO_TOKEN_001\u{bb}"));
+    assert!(!redacted.contains(&sid));
+
+    let response = "\u{ab}SECRET_TWILIO_TOKEN_001\u{bb} rotated yesterday.";
+    assert_eq!(reverse(response, &map), format!("{sid} rotated yesterday."));
+}
+
+#[test]
+fn round_trip_recovers_twilio_auth_token_via_identifier() {
+    // Identifier-anchored branch — capture group 2 is the secret,
+    // identifier prefix stays in the redacted text. Same contract
+    // as AWS_SECRET round-trip.
+    let token = "1234567890abcdef1234567890abcdef";
+    let prompt = format!("TWILIO_AUTH_TOKEN={token}");
+    let mut map = PlaceholderMap::new();
+    let redacted = redact(&prompt, &mut map);
+    assert_eq!(map.len(), 1);
+    assert_eq!(
+        redacted, "TWILIO_AUTH_TOKEN=\u{ab}SECRET_TWILIO_TOKEN_001\u{bb}",
+        "identifier prefix must be preserved verbatim",
+    );
+
+    let response = "\u{ab}SECRET_TWILIO_TOKEN_001\u{bb}";
+    assert_eq!(reverse(response, &map), token);
+}
+
+#[test]
+fn round_trip_recovers_cloudflare_api_token() {
+    // Identifier-anchored; capture group 1 is the secret. The
+    // `CLOUDFLARE_API_TOKEN=` prefix must survive the redact and
+    // the original token text must return on reverse.
+    let token = "abc123_-XYZ789defghijklmnopqrstuvwxyz0123";
+    let prompt = format!("export CLOUDFLARE_API_TOKEN={token}");
+    let mut map = PlaceholderMap::new();
+    let redacted = redact(&prompt, &mut map);
+    assert_eq!(map.len(), 1);
+    assert_eq!(
+        redacted,
+        "export CLOUDFLARE_API_TOKEN=\u{ab}SECRET_CLOUDFLARE_TOKEN_001\u{bb}",
+    );
+
+    let response = "Refresh \u{ab}SECRET_CLOUDFLARE_TOKEN_001\u{bb} via the dashboard.";
+    assert_eq!(
+        reverse(response, &map),
+        format!("Refresh {token} via the dashboard."),
+    );
+}

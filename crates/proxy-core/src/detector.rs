@@ -64,14 +64,18 @@ pub fn scan(input: &str) -> Vec<Finding> {
 
     let mut findings: Vec<Finding> = Vec::new();
     for (kind, re) in &c.regexes {
-        let group_idx = kind.secret_capture_group();
+        let group_indices = kind.secret_capture_groups();
         let threshold = kind.min_entropy();
         for caps in re.captures_iter(input) {
-            // `secret_capture_group` returns 0 for the whole match
-            // (prefix-typed kinds) or a higher index for identifier-
+            // `secret_capture_groups` returns `&[0]` for the whole
+            // match (prefix-typed kinds), `&[1]` for identifier-
             // anchored kinds where the captured secret excludes the
-            // identifier prefix.
-            let Some(m) = caps.get(group_idx) else {
+            // identifier prefix, or a longer slice when the regex
+            // has multiple alternation arms each with their own
+            // capture group (e.g., Twilio's SK-vs-auth-token
+            // alternation). The detector picks the FIRST group in
+            // the list that actually participated in the match.
+            let Some(m) = group_indices.iter().find_map(|&g| caps.get(g)) else {
                 continue;
             };
             // Apply the entropy gate, if any. For kinds without a
@@ -523,5 +527,289 @@ BBBBB
         assert_eq!(pem_findings.len(), 2, "expected two PEM findings, got {f:?}");
         assert!(pem_findings[0].text.contains("AAAAA"));
         assert!(pem_findings[1].text.contains("BBBBB"));
+    }
+
+    // ---- GCP service-account JSON detection --------------------------------
+
+    #[test]
+    fn detects_gcp_service_account_json_blob() {
+        // Realistic flat shape that Google's `gcloud iam
+        // service-accounts keys create` emits (whitespace-free JSON
+        // — that's what our discriminator anchors on). The PEM is
+        // embedded inside the JSON string with `\n` escapes, NOT
+        // literal newlines, because that's the on-disk shape.
+        let blob = r#"{"type":"service_account","project_id":"my-proj-123","private_key_id":"abc123","private_key":"-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBg\n-----END PRIVATE KEY-----\n","client_email":"sa@my-proj.iam.gserviceaccount.com","client_id":"123456789"}"#;
+        let prompt = format!("Here's my key:\n{blob}\nUpload it please.");
+        let f = scan(&prompt);
+        assert_eq!(
+            kinds(&f),
+            vec![SecretKind::GcpServiceAccountJson],
+            "expected exactly one GCP finding, got {f:?}",
+        );
+        assert_eq!(f[0].text, blob, "the whole JSON envelope should be the secret");
+    }
+
+    #[test]
+    fn gcp_service_account_wins_over_inner_pem_match() {
+        // Precedence pin: a GCP service-account JSON blob CAN also
+        // contain a literal-newline PEM private key in its body
+        // (some tooling pretty-prints the value). The detector's
+        // overlap resolver keeps the LONGER match, so the GCP
+        // envelope wins and the inner PEM does NOT produce a
+        // separate `PemPrivateKey` finding.
+        //
+        // Why this matters (Rule 9 — test the WHY): the JSON
+        // envelope itself leaks identifying metadata
+        // (`client_email`, `project_id`, `private_key_id`), so a
+        // PEM-only redaction would leave the project's identity
+        // exposed. One placeholder over the whole blob is the
+        // correct unit of redaction.
+        let blob = "{\"type\":\"service_account\",\"private_key\":\"-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBg\n-----END PRIVATE KEY-----\",\"client_email\":\"sa@proj.iam.gserviceaccount.com\"}";
+        let f = scan(blob);
+        assert_eq!(
+            kinds(&f),
+            vec![SecretKind::GcpServiceAccountJson],
+            "GCP must win over nested PEM; got {f:?}",
+        );
+    }
+
+    #[test]
+    fn does_not_flag_non_service_account_json() {
+        // A JSON object that LOOKS like a config blob but lacks the
+        // `"type":"service_account"` discriminator must not be
+        // flagged. Otherwise users' general `.json` configs would
+        // get redacted as if they were credentials.
+        let s = r#"{"type":"oauth_client","client_id":"abc","client_secret":"xyz"}"#;
+        let f = scan(s);
+        assert!(
+            !f.iter().any(|x| x.kind == SecretKind::GcpServiceAccountJson),
+            "non-service-account JSON must not be flagged as GCP: {f:?}",
+        );
+    }
+
+    #[test]
+    fn gcp_detects_pretty_printed_service_account() {
+        // `jq` and most JSON pretty-printers emit
+        // `"type": "service_account"` with ONE space after the
+        // colon. Users routinely `cat key.json | jq` before
+        // pasting; if the regex required the canonical no-space
+        // form we'd silently miss real keys. The discriminator
+        // tolerates `\s*` around the colon — pin that here.
+        let blob = r#"{"type": "service_account","project_id":"my-proj","client_email":"sa@my-proj.iam.gserviceaccount.com"}"#;
+        let f = scan(blob);
+        assert_eq!(
+            kinds(&f),
+            vec![SecretKind::GcpServiceAccountJson],
+            "pretty-printed (`jq`-style) GCP JSON must match: {f:?}",
+        );
+        assert_eq!(f[0].text, blob, "envelope must round-trip verbatim");
+    }
+
+    #[test]
+    fn gcp_detects_multi_line_indented_service_account() {
+        // The fully indented form `jq .` emits — newlines between
+        // every key, two-space indentation. `(?s)` is what makes
+        // this work; without dotall, `[^{}]*?` would refuse to
+        // cross newlines. We also need the `\s*`-around-`:`
+        // tolerance because indented form has the same space.
+        let blob = "{\n  \"type\": \"service_account\",\n  \"project_id\": \"my-proj\",\n  \"client_email\": \"sa@my-proj.iam.gserviceaccount.com\"\n}";
+        let f = scan(blob);
+        assert_eq!(
+            kinds(&f),
+            vec![SecretKind::GcpServiceAccountJson],
+            "multi-line indented GCP JSON must match: {f:?}",
+        );
+        assert_eq!(f[0].text, blob);
+    }
+
+    // ---- Twilio detection --------------------------------------------------
+
+    #[test]
+    fn detects_twilio_api_key_sid() {
+        // SK + 32 hex chars (34 total). The whole SID is the
+        // captured secret — it's a credential half, half-paired
+        // with a separately-issued secret.
+        let sid = format!("SK{}", "0123456789abcdef".repeat(2));
+        assert_eq!(sid.len(), 34);
+        let s = format!("TWILIO_API_KEY_SID={sid}");
+        let f = scan(&s);
+        assert_eq!(
+            kinds(&f),
+            vec![SecretKind::TwilioAuthToken],
+            "expected one Twilio finding, got {f:?}",
+        );
+        assert_eq!(f[0].text, sid);
+    }
+
+    #[test]
+    fn twilio_account_sid_is_not_a_secret() {
+        // Twilio's Account SID (`AC` + 32 hex) has the same byte
+        // shape as the API-key SID but is intentionally NOT a
+        // secret: Twilio docs explicitly describe it as the Basic-
+        // auth USERNAME, paired with the auth token as the
+        // password. Flagging it would over-redact non-sensitive
+        // tenant identifiers and hide context the model needs
+        // (e.g., it's fine for an Account SID to appear in a stack
+        // trace the user is debugging).
+        let account_sid = format!("AC{}", "0123456789abcdef".repeat(2));
+        let s = format!("TWILIO_ACCOUNT_SID={account_sid}");
+        let f = scan(&s);
+        assert!(
+            !f.iter().any(|x| x.kind == SecretKind::TwilioAuthToken),
+            "Account SID must not be flagged as a Twilio secret: {f:?}",
+        );
+    }
+
+    #[test]
+    fn detects_twilio_auth_token_identifier_anchored() {
+        // The auth token is 32 hex chars with no provider prefix,
+        // so identifier anchoring on `twilio_auth_token=` is the
+        // precision lever. The captured text must exclude the
+        // identifier, same contract as AWS_SECRET.
+        let token = "1234567890abcdef1234567890abcdef";
+        let s = format!("TWILIO_AUTH_TOKEN={token}");
+        let f = scan(&s);
+        assert_eq!(
+            kinds(&f),
+            vec![SecretKind::TwilioAuthToken],
+            "expected auth-token finding, got {f:?}",
+        );
+        assert_eq!(
+            f[0].text, token,
+            "capture group must exclude the identifier prefix",
+        );
+    }
+
+    #[test]
+    fn does_not_flag_twilio_auth_token_when_identifier_is_word_suffix() {
+        // Same `\b` precision lever as AWS_SECRET — a `\b` before
+        // the identifier prevents `not_twilio_auth_token=...` from
+        // matching, which would otherwise over-redact misnamed
+        // config keys.
+        let s = "not_twilio_auth_token=1234567890abcdef1234567890abcdef";
+        let f = scan(s);
+        assert!(
+            !f.iter().any(|x| x.kind == SecretKind::TwilioAuthToken),
+            "suffix-of-larger-identifier must not be flagged: {f:?}",
+        );
+    }
+
+    #[test]
+    fn does_not_flag_bare_32_hex_without_twilio_identifier() {
+        // A bare 32-hex string with no `twilio_auth_token`
+        // identifier looks exactly like an MD5 hash, a Git commit
+        // SHA prefix, an etag, or a request ID. Identifier
+        // anchoring is what makes the difference between "secret"
+        // and "any other 32-hex value" — without it the false-
+        // positive rate would tank the user experience.
+        let s = "etag: 9e107d9d372bb6826bd81d3542a419d6, commit b7c5a3";
+        let f = scan(s);
+        assert!(
+            !f.iter().any(|x| x.kind == SecretKind::TwilioAuthToken),
+            "bare 32-hex without identifier must not be flagged: {f:?}",
+        );
+    }
+
+    #[test]
+    fn twilio_sk_prefix_must_be_uppercase() {
+        // Twilio documents API-key SIDs as `SK` (UPPERCASE) followed
+        // by 32 lowercase hex chars. Matching `sk` + 32 hex would
+        // be a precision bug for two reasons:
+        //
+        // (1) `sk` is the prefix of OpenAI legacy keys (`sk-...`)
+        //     and a common substring in unrelated text; treating it
+        //     as a Twilio SID would over-redact.
+        //
+        // (2) The global aho-corasick prefilter combines every
+        //     kind's keywords into ONE table; an input containing
+        //     ANY kind's keyword (e.g., `AKIA` from AWS) passes the
+        //     gate for every kind, including Twilio. If the Twilio
+        //     regex used `(?i)` on the SK arm, a random 34-char
+        //     lowercase-hex token in a doc that ALSO mentions an
+        //     AWS key would false-positive as Twilio.
+        //
+        // The fixture: an AWS access key (trips the prefilter) plus
+        // a separate 34-char lowercase-hex token shaped like `sk` +
+        // 32 hex. Only the AWS finding should appear.
+        let lowercase_sk = format!("sk{}", "0123456789abcdef".repeat(2));
+        assert_eq!(lowercase_sk.len(), 34);
+        let s = format!("AKIAIOSFODNN7EXAMPLE log line: {lowercase_sk}");
+        let f = scan(&s);
+        assert!(
+            !f.iter().any(|x| x.kind == SecretKind::TwilioAuthToken),
+            "lowercase `sk` + 32 hex must NOT be flagged as Twilio: {f:?}",
+        );
+    }
+
+    // ---- Cloudflare API token detection ------------------------------------
+
+    #[test]
+    fn detects_cloudflare_api_token_identifier_anchored() {
+        // Cloudflare tokens have no provider prefix — identifier
+        // anchoring on `cloudflare_api_token=` (and the shorter
+        // `cf_api_token=` / `cf_token=` aliases) is the lever.
+        // High-entropy URL-safe random body, ~40 chars. Asserting
+        // the length is within the regex's documented {30,80}
+        // range so a future format-bump test won't pass with a
+        // sample that falls outside the accepted window.
+        let token = "abc123_-XYZ789defghijklmnopqrstuvwxyz0123";
+        assert!(
+            (30..=80).contains(&token.len()),
+            "test fixture must fit the documented Cloudflare token length range",
+        );
+        let s = format!("CLOUDFLARE_API_TOKEN={token}");
+        let f = scan(&s);
+        assert_eq!(
+            kinds(&f),
+            vec![SecretKind::CloudflareApiToken],
+            "expected one Cloudflare finding, got {f:?}",
+        );
+        assert_eq!(
+            f[0].text, token,
+            "capture group must exclude the identifier prefix",
+        );
+    }
+
+    #[test]
+    fn detects_cloudflare_api_token_via_cf_aliases() {
+        // The shorter `CF_API_TOKEN` and `CF_TOKEN` env-var names
+        // are common in Cloudflare's own CLI tools (e.g., wrangler).
+        // Both must match the same kind so the placeholder map
+        // collapses them consistently.
+        let token = "abc123_-XYZ789defghijklmnopqrstuvwxyz0123";
+        for ident in &["CF_API_TOKEN", "cf_token"] {
+            let s = format!("{ident}={token}");
+            let f = scan(&s);
+            assert_eq!(
+                kinds(&f),
+                vec![SecretKind::CloudflareApiToken],
+                "alias {ident} should match Cloudflare: {f:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn does_not_flag_cloudflare_token_with_low_entropy() {
+        // Same gate as AWS_SECRET. A 40-char all-zeros string after
+        // the identifier matches the regex shape but obviously
+        // isn't a real token. Entropy gate drops it.
+        let s = "CLOUDFLARE_API_TOKEN=0000000000000000000000000000000000000000";
+        let f = scan(s);
+        assert!(
+            !f.iter().any(|x| x.kind == SecretKind::CloudflareApiToken),
+            "all-zeros must be entropy-filtered: {f:?}",
+        );
+    }
+
+    #[test]
+    fn does_not_flag_cloudflare_token_when_identifier_is_word_suffix() {
+        // `\b` precision lever — `not_cloudflare_api_token=...`
+        // must not match. Same rationale as AWS_SECRET and Twilio.
+        let s = "not_cloudflare_api_token=abc123_-XYZ789defghijklmnopqrstuvwxyz0123";
+        let f = scan(s);
+        assert!(
+            !f.iter().any(|x| x.kind == SecretKind::CloudflareApiToken),
+            "suffix-of-larger-identifier must not be flagged: {f:?}",
+        );
     }
 }
