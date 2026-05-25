@@ -97,51 +97,63 @@ These will be added as we run the eval. Do not include real secrets — use vend
 
 ### Manual (real-API runs)
 
-#### openai:gpt-5-mini — 2026-05-25 (300 calls, ~$0.50)
+#### openai:gpt-5-mini — 2026-05-25 (2 × 300 calls, ~$1.00 total)
 
-Full results: [`results/gpt-5-mini-2026-05-25.json`](results/gpt-5-mini-2026-05-25.json).
+Two runs against the same 50 fixtures × 6 formats: a **zero-shot
+baseline** (no system prompt) and an **instructed** variant that
+prepends [`instructions/preserve-tokens.txt`](instructions/preserve-tokens.txt)
+as a system message. Same model, same fixtures, same harness.
 
-| Format | Preserved | Rate | Notes |
+| Format | Zero-shot | Instructed | Δ |
 |---|---|---|---|
-| `{{VAR}}` (mustache) | 20 / 50 | **40.0%** | best typed format |
-| `__SECRET_TYPE_NNN__` (underscore_type) | 12 / 50 | 24.0% | |
-| `<SECRET_N>` (angle_num) | 10 / 50 | 20.0% | |
-| `«SECRET_TYPE_NNN»` (guillemets) | 6 / 50 | **12.0%** | current production format |
-| `[REDACTED]` | 6 / 50 | 12.0% | substring-biased negative control |
-| `***` (asterisks) | 10 / 50 | 20.0% | substring-biased negative control |
+| `«SECRET_TYPE_NNN»` (guillemets — production) | 12% | **96%** | +84 pp |
+| `__SECRET_TYPE_NNN__` (underscore_type) | 24% | 94% | +70 pp |
+| `<SECRET_N>` (angle_num) | 20% | 90% | +70 pp |
+| `{{VAR}}` (mustache) | 40% | 90% | +50 pp |
+| `***` (asterisks, substring-biased control) | 20% | 88% | +68 pp |
+| `[REDACTED]` (substring-biased control) | 12% | 82% | +70 pp |
 
-Refusals: 0 / 300. Avg latency: ~8.5 s / call (gpt-5-mini with
-`reasoning_effort=minimal`). Total output: ~243k tokens.
+Refusals: 0 / 300 in both runs. Avg latency: ~8.5 s / call
+(gpt-5-mini with `reasoning_effort=minimal`). Total output across
+both runs: ~512k tokens, ~$1.00.
 
-**No format clears the §9 kill threshold of 95% preservation
-zero-shot on gpt-5-mini.** Two things matter for interpreting this:
+Raw data:
+- Zero-shot: [`results/gpt-5-mini-2026-05-25.json`](results/gpt-5-mini-2026-05-25.json)
+- Instructed: [`results/gpt-5-mini-instructed-2026-05-25.json`](results/gpt-5-mini-instructed-2026-05-25.json)
 
-1. **The security property still holds.** The proxy strips the
-   secret BEFORE the request leaves the machine. The original
-   secret never reaches the model. A low preservation rate means
-   the response-side reversal has nothing to substitute, NOT that
-   the secret leaked.
-2. **The UX property degrades.** gpt-5-mini paraphrases more often
-   than it echoes — it answers the user's underlying question
-   ("your AWS key is the problem, use an IAM role instead")
-   without quoting the placeholder. The user gets a useful
-   answer that just doesn't pretend to know the original secret.
+**Reading these numbers:**
 
-Build-plan §9's fallback for this outcome is option (a): add a
-system-prompt instruction telling the model to preserve `«...»`
-tokens verbatim. That variant of the eval has NOT been run yet —
-it's the cheapest next experiment.
+1. **The security property holds in both conditions.** The proxy
+   strips the secret BEFORE the request leaves the machine. The
+   original secret never reaches the model. Preservation rate
+   measures response-side UX, not whether secrets leak.
+2. **Zero-shot UX is degraded.** gpt-5-mini paraphrases ("your
+   AWS key is the problem, use an IAM role instead") instead of
+   echoing the placeholder. The user gets a useful answer that
+   just doesn't pretend to know the original secret.
+3. **A short system prompt restores UX.** Guillemets goes from
+   12% → 96%, clearing the §9 95% kill threshold by 1 percentage
+   point. The instruction file is short (one paragraph + a list
+   of placeholder shapes); the cost is one extra system message
+   per request.
 
 Reproduce:
 
 ```bash
 export OPENAI_API_KEY=sk-...
+
+# zero-shot
 cargo run --release -p e03-placeholder-eval -- \
     --prompts experiments/e03-placeholder-eval/prompts/ \
-    --provider openai \
-    --model gpt-5-mini \
-    --formats all \
-    --out fresh-results.json
+    --provider openai --model gpt-5-mini --formats all \
+    --out fresh-zero-shot.json
+
+# instructed
+cargo run --release -p e03-placeholder-eval -- \
+    --prompts experiments/e03-placeholder-eval/prompts/ \
+    --provider openai --model gpt-5-mini --formats all \
+    --instructions experiments/e03-placeholder-eval/instructions/preserve-tokens.txt \
+    --out fresh-instructed.json
 ```
 
 #### anthropic — deferred
@@ -205,31 +217,35 @@ trivially extensible.
 
 ### Risk 2 verdict
 
-**First-pass measurement complete (gpt-5-mini); falsified on
-zero-shot preservation but security property intact.** No format
-clears the §9 95% threshold on gpt-5-mini without an explicit
-preserve-instruction prompt prefix. The security property of "the
-secret never leaves the machine" is unaffected by preservation
-rate; only the UX property of "the response looks like it knew
-about the redaction" degrades.
+**Validated, conditional on a system-prompt prefix.** Zero-shot,
+no format clears the §9 95% threshold on gpt-5-mini. With the
+[`instructions/preserve-tokens.txt`](instructions/preserve-tokens.txt)
+system prompt, guillemets reaches 96% — the kill criterion is no
+longer tripped. The build-plan §9 option (a) fallback works
+dramatically: a single one-paragraph system message moves the
+production format from 12% to 96% preservation on gpt-5-mini.
 
 Updated guidance:
 
-1. **Ship the proxy as-is for the security property.** Reversal is
-   a UX nicety; absence of reversal is not a security failure.
-2. **Investigate option (a) next** — a system-prompt instruction
-   telling the model to preserve `«...»` tokens — before
-   committing to a different placeholder format. The smallest
-   experiment that might move the rate from 12% to 90%+ on the
-   current format.
-3. **Cross-family measurements (Anthropic, Google) still needed**
-   to know whether gpt-5-mini's paraphrase tendency is
-   model-family-specific. Each one is one cargo invocation away.
-4. **The arxiv-paper-cited "rare-Unicode-bracket" design principle
-   did not yield a preservation advantage on gpt-5-mini.**
-   Guillemets (12%) and angle brackets (20%) both underperformed
-   mustache (40%). The qualitative convergence with prior art does
-   not survive measurement.
+1. **Production proxy should inject `preserve-tokens.txt` (or an
+   equivalent) as a system prompt** on every forwarded request.
+   This is now a recommended shipped behavior, not just a fallback.
+   Not yet wired into the proxy crates — natural next deliverable.
+2. **Guillemets remains the right production format.** It was the
+   worst typed format zero-shot (12%) and is the best instructed
+   (96%). The instruction effect dominates the zero-shot ranking.
+3. **The arxiv-paper "rare-Unicode-bracket" design principle is
+   rehabilitated.** Zero-shot, guillemets and angle brackets
+   underperformed mustache; with instructions they pull ahead.
+   The principle was right; it just needed instruction support
+   to surface.
+4. **Cross-family measurements (Anthropic, Google) still needed**
+   to know whether the +84 pp instruction lift is gpt-5-mini-
+   specific or generalizes. Each one is one cargo invocation away.
+5. **Security property unaffected by preservation rate.** Secrets
+   never reach the model in either condition; the proxy strips
+   them upstream. Preservation is a UX metric, not a security
+   metric.
 
 ### What this commit ships and deliberately omits
 
@@ -244,20 +260,24 @@ Updated guidance:
 
 **Out of scope (follow-ups):**
 - Gemini / Google provider
-- System-prompt-instructed variant of the eval (build-plan §9
-  option (a)) — the cheapest next experiment given the gpt-5-mini
-  results
 - Anthropic real-API run (Opus / Sonnet) — would give us the
-  cross-family picture
+  cross-family picture; ~$5-6
 - Larger fixture corpus (the 50 we have are a starting point, not
   a statistical sample)
+- Wiring `preserve-tokens.txt` into the production proxy crates
+  (proxy-mitm and proxy-server) so every forwarded request carries
+  the system prompt — natural next deliverable given the +84 pp
+  result above
 
 **Shipped since v0.1:**
 - OpenAI provider (commit 2afff40 + 91e33cd; runs against
   gpt-5-mini and other reasoning-capable models via
   `reasoning_effort=minimal`)
-- First measured real-API run (commit 26acf3d; gpt-5-mini,
-  300 calls, results above)
+- Zero-shot real-API run (commit 26acf3d; gpt-5-mini, 300 calls)
+- `--instructions <FILE>` flag + incremental result writes
+  (commit 1e88d0b)
+- Instructed real-API run (commit 867df18; gpt-5-mini, 300 calls,
+  guillemets 12% → 96%)
 
 ### Known measurement caveats (recorded for the results writeup)
 

@@ -140,31 +140,43 @@ not adversarial.
   `«SECRET_AWS_KEY_001»` verbatim in its response, we reverse it back to
   the original secret. When the model paraphrases ("your AWS key"), there
   is nothing to substitute and the user sees the placeholder gone from
-  the response. **First measurement (2026-05-25, openai:gpt-5-mini,
-  50 fixtures × 6 formats = 300 calls, zero-shot, no instruction prefix,
-  results at [`experiments/e03-placeholder-eval/results/gpt-5-mini-2026-05-25.json`](experiments/e03-placeholder-eval/results/gpt-5-mini-2026-05-25.json)):**
+  the response. **Measured on openai:gpt-5-mini, 50 fixtures × 6 formats
+  = 300 calls per condition, 2026-05-25:**
 
-  | Format | Preservation rate | Notes |
-  |---|---|---|
-  | `{{VAR}}` (mustache) | **40%** | best typed format on this model |
-  | `__SECRET_TYPE_NNN__` (underscore_type) | 24% | |
-  | `<SECRET_N>` (angle_num) | 20% | |
-  | `«SECRET_TYPE_NNN»` (guillemets) | **12%** | current production format |
-  | `[REDACTED]` / `***` | 12% / 20% | substring-biased negative controls |
+  | Format | Zero-shot | Instructed | Δ |
+  |---|---|---|---|
+  | `«SECRET_TYPE_NNN»` (guillemets — production) | 12% | **96%** | +84 pp |
+  | `__SECRET_TYPE_NNN__` (underscore_type) | 24% | 94% | +70 pp |
+  | `<SECRET_N>` (angle_num) | 20% | 90% | +70 pp |
+  | `{{VAR}}` (mustache) | 40% | 90% | +50 pp |
+  | `***` / `[REDACTED]` (substring-biased controls) | 20% / 12% | 88% / 82% | +68 / +70 pp |
 
-  Refusals: 0 / 300. The safety-refusal mode build-plan §7 worried
-  about does not appear on gpt-5-mini. **None of the formats clear
-  build-plan §9's 95% preservation threshold zero-shot.** This does
-  NOT mean secrets leak — the proxy strips them BEFORE the request
-  leaves the machine; the original secret never reaches the model.
-  It DOES mean the response-side reversal often has nothing to
-  substitute, because gpt-5-mini paraphrases ("your AWS key is the
-  problem...") instead of echoing the placeholder. The user gets a
-  useful answer with no original secret in it — the **security
-  property holds**; the **UX property of "the response looks like
-  it never knew about the redaction" does not**. Cross-family
-  measurements (Anthropic, Google) and a system-prompt-instructed
-  variant of this eval remain follow-up work.
+  Refusals: 0 / 300 in both conditions. Raw results at
+  [`experiments/e03-placeholder-eval/results/gpt-5-mini-2026-05-25.json`](experiments/e03-placeholder-eval/results/gpt-5-mini-2026-05-25.json)
+  (zero-shot) and
+  [`gpt-5-mini-instructed-2026-05-25.json`](experiments/e03-placeholder-eval/results/gpt-5-mini-instructed-2026-05-25.json)
+  (with system prompt at
+  [`instructions/preserve-tokens.txt`](experiments/e03-placeholder-eval/instructions/preserve-tokens.txt)).
+
+  **Reading these numbers:**
+
+  - **Security property holds in both conditions.** The proxy strips
+    the secret BEFORE the request leaves the machine; the original
+    secret never reaches the model. Preservation rate measures
+    response-side UX, NOT whether secrets leak.
+  - **Zero-shot UX is degraded.** Without a system prompt,
+    gpt-5-mini paraphrases ("your AWS key is the problem...")
+    instead of echoing the placeholder. The user still gets a useful
+    answer, just with no original secret restored where they'd
+    expect it.
+  - **With a short system prompt, UX is restored.** Guillemets
+    clears build-plan §9's 95% threshold (96%). The system prompt
+    file is the recommended template for any production deployment
+    that wants the response-side reversal to work.
+
+  Cross-family measurement (Anthropic Opus/Sonnet, Google Gemini)
+  remains deferred — same harness, one CLI flag away once budget
+  exists.
 - **Traffic outside the proxy.** DNS lookups, ICMP, anything not routed
   through `HTTPS_PROXY` / base URL config. The proxy only sees what the
   agent CHOOSES to route through it.
