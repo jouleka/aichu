@@ -43,3 +43,23 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "ti
 # HTTP/2 client we can fully control on a single connection.
 h2 = "0.4"
 http = "1"
+# tokio-rustls drives the HTTPS-CONNECT-tunneled variant of the H2
+# multiplex test: we manually speak HTTP/1.1 CONNECT to the proxy, wrap
+# the tunnelled socket in a TlsConnector trusting the aichu CA, then
+# run h2 inside that TLS stream. Going through tokio-rustls directly
+# (instead of reqwest) gives us deterministic control over connection
+# pooling so the two streams are guaranteed to multiplex on ONE
+# tunnel — same shape as the existing plain-H2 test, but exercising
+# the inner `service_fn` path that real HTTPS clients hit.
+tokio-rustls = "0.26"
+# Parses PEM-encoded CA and upstream-cert blocks into the
+# `CertificateDer` form rustls expects in its root store. Pulled in
+# only by the HTTPS-CONNECT integration test below.
+rustls-pemfile = "2"
+# Used by the HTTPS-CONNECT test to spawn a proxy whose upstream
+# connector trusts the test's self-signed upstream cert. Hudsucker's
+# `with_rustls_connector` hard-wires webpki_roots, which can't be
+# coaxed into trusting a self-signed test cert — so the test
+# bypasses `run_proxy` for that one case and assembles the proxy via
+# `with_http_connector` with a hyper-rustls connector we build here.
+hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "http2", "tls12", "aws-lc-rs", "logging"] }

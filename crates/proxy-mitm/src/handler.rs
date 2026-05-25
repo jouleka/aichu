@@ -484,6 +484,122 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proxy_core::SecretKind;
+
+    #[test]
+    fn default_handler_has_no_current_map_and_inject_on() {
+        // Pins the two struct defaults that the rest of the request
+        // path relies on:
+        //
+        //   - `current_map: None` — handle_response uses
+        //     `self.current_map.take()` as its "did the outbound side
+        //     mint anything?" signal. A handler that booted with
+        //     `Some(empty_map)` instead would route every response
+        //     through the reverse-pass branch even on requests that
+        //     touched no prompt endpoint, which is wasted work at best
+        //     and a subtle behavior shift at worst.
+        //
+        //   - `inject_system_prompt: true` — this is the e03-measured
+        //     default ON shipped in 82ce30e. A regression that flipped
+        //     this default would silently regress guillemets
+        //     preservation from 96% to 12% on gpt-5-mini for everyone
+        //     who never set `--no-system-prompt` (i.e., everyone).
+        let h = AichuHandler::new();
+        assert!(
+            h.current_map.is_none(),
+            "fresh handler must start with no pending map",
+        );
+        assert!(
+            h.inject_system_prompt,
+            "preserve-tokens injection must default ON \
+             (e03 measured 96% vs 12% lift on gpt-5-mini)",
+        );
+    }
+
+    #[test]
+    fn with_inject_system_prompt_toggles_the_field() {
+        // Pins the builder semantics the CLI relies on for
+        // `--no-system-prompt`. If the setter ever no-op'd or only
+        // accepted `true`, the flag would silently fail to opt out
+        // and the user would see surprising prompt mutation on
+        // their forwarded bodies.
+        let off = AichuHandler::new().with_inject_system_prompt(false);
+        assert!(
+            !off.inject_system_prompt,
+            "with_inject_system_prompt(false) must clear the field",
+        );
+        let on_again = off.with_inject_system_prompt(true);
+        assert!(
+            on_again.inject_system_prompt,
+            "with_inject_system_prompt(true) must restore the field",
+        );
+    }
+
+    #[test]
+    fn clone_creates_independent_current_map_slot() {
+        // The whole invariant that makes the per-clone fix work:
+        // hudsucker clones the handler once per request, and the two
+        // clones MUST hold independent `current_map` slots. If a
+        // future refactor accidentally wraps `current_map` in an
+        // `Arc<Mutex<_>>` or similar shared cell, two concurrent
+        // HTTP/2 streams on one TCP connection would race on the
+        // same slot — exactly the privacy bug commit 8dd213d fixed
+        // by moving the map out of the shared Arc<Mutex<HashMap>>.
+        //
+        // Asserting at the field level here gives us a unit-level
+        // pin so a regression points directly at the data layout,
+        // not the integration-test surface where the symptom looks
+        // like cross-stream leakage and the diagnosis takes longer.
+        let original = AichuHandler::new();
+        let mut clone = original.clone();
+
+        let mut map = PlaceholderMap::new();
+        // Mint one placeholder so the map is non-empty; the
+        // production code's `if !map.is_empty()` guard is the only
+        // path that ever writes to `current_map`.
+        let _ = map.placeholder_for(SecretKind::AwsAccessKey, "AKIAIOSFODNN7EXAMPLE");
+        clone.current_map = Some(map);
+
+        assert!(
+            clone.current_map.is_some(),
+            "clone's map slot should hold the value we just wrote",
+        );
+        assert!(
+            original.current_map.is_none(),
+            "writing to the clone's slot must NOT mutate the original — \
+             this is the per-clone independence invariant. A failure \
+             here means cross-stream state is shared.",
+        );
+    }
+
+    #[test]
+    fn taking_current_map_empties_the_slot() {
+        // Mirrors the production `handle_response` call site:
+        // `let map = self.current_map.take()` — the slot must be
+        // empty AFTER the take so a subsequent (hypothetical) reuse
+        // of this clone cannot leak the same map into an unrelated
+        // request. Hudsucker today drops the clone after the
+        // response, but pinning take-empties-the-slot here keeps the
+        // invariant load-bearing if future hudsucker versions ever
+        // reuse handler clones across requests.
+        let mut h = AichuHandler::new();
+        let mut map = PlaceholderMap::new();
+        let placeholder = map.placeholder_for(SecretKind::AwsAccessKey, "AKIAIOSFODNN7EXAMPLE");
+        h.current_map = Some(map);
+
+        let taken = h.current_map.take().expect("map was set above");
+        assert!(
+            h.current_map.is_none(),
+            "Option::take must empty the slot — the production code in \
+             handle_response relies on this to prevent map reuse across \
+             requests if a handler clone is ever recycled.",
+        );
+        assert_eq!(
+            taken.original_for(&placeholder),
+            Some("AKIAIOSFODNN7EXAMPLE"),
+            "the map we took back must be the exact one we put in",
+        );
+    }
 
     #[test]
     fn injection_shape_for_recognizes_every_known_prompt_endpoint() {

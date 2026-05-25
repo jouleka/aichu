@@ -737,6 +737,282 @@ async fn mitm_does_not_inject_on_non_prompt_endpoints() -> Result<()> {
     Ok(())
 }
 
+/// HTTP/2 multiplexing regression test — through the HTTPS CONNECT
+/// tunnel this time.
+///
+/// `mitm_isolates_concurrent_h2_streams_on_one_connection` (above)
+/// exercises hudsucker's OUTER dispatcher: plain HTTP/2 over a raw
+/// TCP socket directly to the proxy. The fix sits on the handler's
+/// per-clone `current_map` field, and hudsucker clones per request
+/// on both the outer path AND the inner `service_fn` it spins up
+/// inside `serve_stream` for tunnelled requests
+/// (`hudsucker::proxy::internal::InternalProxy::serve_stream` calls
+/// `self.clone().proxy(req)` for each request). So the same
+/// invariant must hold on both paths — but only the outer path is
+/// covered by the plain-H2 test.
+///
+/// This test pins that the per-clone fix ALSO holds for requests
+/// arriving through HTTPS CONNECT. We drive:
+///
+///   1. A real H2-over-TLS upstream (rustls server + h2 server)
+///      bound on a localhost port.
+///   2. The aichu MITM proxy in front of it with its own CA.
+///   3. A raw TCP socket to the proxy → manual
+///      `CONNECT <host>:<port>` line → wrap in `tokio_rustls`
+///      `TlsConnector` (trusting both the upstream's leaf cert and
+///      the aichu CA) → `h2::client::handshake` inside the TLS
+///      stream.
+///
+/// Two concurrent H2 streams ride one TCP+TLS connection through
+/// the CONNECT tunnel. Hudsucker's inner `service_fn` clones the
+/// handler per stream (verified in source). If a regression
+/// reintroduces same-key collisions (or accidentally wraps
+/// `current_map` in `Arc<Mutex<_>>`), one stream's response would
+/// carry the OTHER stream's secret restored — exact same failure
+/// mode the outer test pins, but on a different code path.
+///
+/// Going through `tokio_rustls` directly instead of reqwest is
+/// deliberate: reqwest's connection pool can be coaxed into HTTP/2
+/// multiplexing but the behavior is opaque enough that a
+/// regression in pool behavior could quietly mask the multiplex
+/// race we're trying to catch. Doing the raw CONNECT + TLS +
+/// h2-on-one-conn dance guarantees the two streams share one
+/// connection.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mitm_isolates_concurrent_h2_streams_under_https_connect_tunnel() -> Result<()> {
+    use bytes::Bytes as H2Bytes;
+    use http::Request as H2Request;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    // The MITM mints leaf certs with `SanType::DnsName(authority.host())`,
+    // so we CONNECT to a DNS name ("localhost") rather than the bare
+    // IP — TLS stacks accept either for the SNI/match, but the rustls
+    // server-side parsing on the proxy is happier with a DNS SAN.
+    const TUNNEL_HOST: &str = "localhost";
+
+    let (upstream_addr, upstream_cert_pem) =
+        spawn_h2_tls_echoing_upstream(TUNNEL_HOST).await?;
+
+    let ca_dir = TempDir::new()?;
+    let ca = load_or_create_ca(ca_dir.path())?;
+    let aichu_ca_pem = ca.cert_pem.clone();
+
+    // Same rationale as the plain-H2 test: the echo upstream replays
+    // the (post-injection) request body verbatim, so the injected
+    // preserve-tokens schema text would round-trip back into the
+    // client's response body and trip the "no placeholder string
+    // leaked" assertion below. That assertion is the load-bearing
+    // privacy invariant we're pinning here, so we disable injection
+    // to keep the test focused on the H2-keying bug it was built to
+    // catch.
+    let handler = AichuHandler::new().with_inject_system_prompt(false);
+    // Build the proxy with a CUSTOM upstream connector that trusts
+    // the test's self-signed upstream cert. `proxy_mitm::run_proxy`
+    // wires `with_rustls_connector`, which hard-wires webpki_roots —
+    // those don't include our test cert, so without this override
+    // the proxy returns 502 trying to verify the upstream's chain.
+    // Production code is unaffected; this is purely a test-rig
+    // limitation around self-signed test certs.
+    let (proxy_addr, shutdown_tx) =
+        spawn_proxy_trusting_upstream(ca.authority, handler, &upstream_cert_pem).await?;
+
+    let secret_a = "AKIAAAAAAAAAAAAAAAAA";
+    let secret_b = "AKIABBBBBBBBBBBBBBBB";
+    let body_a = format!(
+        r#"{{"model":"m","max_tokens":1,"messages":[{{"role":"user","content":"req-a uses {secret_a}"}}]}}"#
+    );
+    let body_b = format!(
+        r#"{{"model":"m","max_tokens":1,"messages":[{{"role":"user","content":"req-b uses {secret_b}"}}]}}"#
+    );
+
+    // Trust the aichu CA on the client side. The proxy terminates
+    // TLS with us (it MITMs by minting a leaf signed by the aichu
+    // CA), so the only cert the client ever validates is the one
+    // the proxy presents. The upstream's cert is validated on the
+    // proxy↔upstream hop by the connector we wired in
+    // `spawn_proxy_trusting_upstream`, never here. We don't need to
+    // trust it on the client.
+    let mut root_store = tokio_rustls::rustls::RootCertStore::empty();
+    let mut cursor = std::io::Cursor::new(aichu_ca_pem.as_slice());
+    for cert in rustls_pemfile::certs(&mut cursor) {
+        let cert = cert.map_err(|e| anyhow::anyhow!("parse aichu CA PEM: {e}"))?;
+        root_store
+            .add(cert)
+            .map_err(|e| anyhow::anyhow!("add aichu CA to client roots: {e}"))?;
+    }
+    let mut tls_config = tokio_rustls::rustls::ClientConfig::builder()
+        .with_root_certificates(root_store)
+        .with_no_client_auth();
+    // ALPN: ask for h2. The proxy's MITM leaf-cert server config
+    // advertises ["h2", "http/1.1"] (per hudsucker's
+    // rcgen_authority.rs:111-115 when the http2 feature is on), so
+    // requesting h2 here forces the inner connection into HTTP/2 —
+    // which is the whole point of this test.
+    tls_config.alpn_protocols = vec![b"h2".to_vec()];
+    let tls_connector = tokio_rustls::TlsConnector::from(Arc::new(tls_config));
+
+    // The full CONNECT → TLS → H2 round-trip, wrapped in a single
+    // timeout so a regression that wedges the proxy fails loudly
+    // instead of hanging the test binary.
+    let round_trip = async {
+        // 1. Raw TCP to the proxy.
+        let mut tcp = TcpStream::connect(proxy_addr).await?;
+
+        // 2. HTTP/1.1 CONNECT.
+        let connect_line = format!(
+            "CONNECT {TUNNEL_HOST}:{port} HTTP/1.1\r\nHost: {TUNNEL_HOST}:{port}\r\n\r\n",
+            port = upstream_addr.port(),
+        );
+        tcp.write_all(connect_line.as_bytes()).await?;
+
+        // Read until end-of-headers (\r\n\r\n). Small fixed buffer is
+        // fine — hudsucker's CONNECT response is a tiny `200 OK` with
+        // no body.
+        let mut header_buf = Vec::with_capacity(256);
+        let mut byte = [0u8; 1];
+        loop {
+            tcp.read_exact(&mut byte).await?;
+            header_buf.push(byte[0]);
+            if header_buf.ends_with(b"\r\n\r\n") {
+                break;
+            }
+            if header_buf.len() > 4096 {
+                anyhow::bail!("CONNECT response headers exceeded 4 KiB");
+            }
+        }
+        let response_head = std::str::from_utf8(&header_buf)?;
+        if !response_head.starts_with("HTTP/1.1 200")
+            && !response_head.starts_with("HTTP/1.0 200")
+        {
+            anyhow::bail!("proxy refused CONNECT: {response_head}");
+        }
+
+        // 3. TLS over the tunnel.
+        let server_name = tokio_rustls::rustls::pki_types::ServerName::try_from(TUNNEL_HOST)
+            .map_err(|e| anyhow::anyhow!("invalid SNI name: {e}"))?;
+        let tls = tls_connector.connect(server_name, tcp).await?;
+
+        // Confirm we negotiated h2 — if not, this test isn't
+        // exercising what it claims to. Surfaces loud rather than
+        // silently passing on an HTTP/1.1 fallback.
+        let alpn = tls
+            .get_ref()
+            .1
+            .alpn_protocol()
+            .map(|b| b.to_vec())
+            .unwrap_or_default();
+        if alpn.as_slice() != b"h2" {
+            anyhow::bail!(
+                "negotiated ALPN was {:?}, expected b\"h2\" — this test \
+                 must run over HTTP/2 to exercise multiplexing",
+                String::from_utf8_lossy(&alpn),
+            );
+        }
+
+        // 4. H2 over TLS.
+        let (mut h2_client, h2_conn) = h2::client::handshake(tls).await?;
+        let conn_task = tokio::spawn(async move {
+            let _ = h2_conn.await;
+        });
+
+        // The path here is the prompt-endpoint path so the proxy's
+        // redaction allow-list lets us through. The authority must
+        // match the cert SAN ("localhost") because hyper/h2 validates
+        // the :authority pseudo-header against the cert.
+        let uri = format!(
+            "https://{host}:{port}/v1/messages",
+            host = TUNNEL_HOST,
+            port = upstream_addr.port(),
+        );
+        let req_a = H2Request::builder()
+            .method("POST")
+            .uri(&uri)
+            .body(())
+            .unwrap();
+        let req_b = H2Request::builder()
+            .method("POST")
+            .uri(&uri)
+            .body(())
+            .unwrap();
+
+        // Send both stream headers before either body, then both
+        // bodies — same interleave as the outer-path test: forces the
+        // proxy to clone the handler for BOTH requests before either
+        // response can come back, so a same-slot regression races on
+        // a shared `current_map`.
+        let (resp_a_fut, mut send_a) = h2_client.send_request(req_a, false).unwrap();
+        let (resp_b_fut, mut send_b) = h2_client.send_request(req_b, false).unwrap();
+        send_a.send_data(H2Bytes::from(body_a.clone()), true).unwrap();
+        send_b.send_data(H2Bytes::from(body_b.clone()), true).unwrap();
+        drop(h2_client);
+
+        let (resp_a, resp_b) = tokio::try_join!(resp_a_fut, resp_b_fut)?;
+        assert_eq!(resp_a.status(), 200, "response A should be 200 over CONNECT+H2");
+        assert_eq!(resp_b.status(), 200, "response B should be 200 over CONNECT+H2");
+
+        let body_a_local = collect_h2_body(resp_a.into_body()).await?;
+        let body_b_local = collect_h2_body(resp_b.into_body()).await?;
+
+        conn_task.abort();
+        Ok::<(String, String), anyhow::Error>((body_a_local, body_b_local))
+    };
+
+    let (body_a_recv, body_b_recv) = match tokio::time::timeout(
+        Duration::from_secs(20),
+        round_trip,
+    )
+    .await
+    {
+        Ok(Ok(t)) => t,
+        Ok(Err(e)) => return Err(e),
+        Err(_) => anyhow::bail!(
+            "CONNECT+TLS+H2 round-trip timed out — likely a regression \
+             in the per-clone `current_map` invariant on hudsucker's \
+             inner `service_fn` path. The race-condition assertions \
+             below cannot run without both responses."
+        ),
+    };
+
+    // Same headline contract as the plain-H2 sibling test: each
+    // response carries its OWN secret, neither carries the other's,
+    // no placeholder leaks. If this fires, the inner `service_fn`
+    // path is sharing state across HTTP/2 streams on a CONNECT
+    // tunnel — exactly the multiplex race that motivated the
+    // per-clone design.
+    assert!(
+        body_a_recv.contains(secret_a),
+        "response A is missing its own secret ({secret_a}) under HTTPS CONNECT — \
+         inner `service_fn` reverse pass used the wrong map. Got: {body_a_recv}"
+    );
+    assert!(
+        !body_a_recv.contains(secret_b),
+        "response A leaked request B's secret ({secret_b}) — \
+         HTTP/2 multiplex race in the CONNECT-tunnel `current_map`. \
+         Got: {body_a_recv}"
+    );
+    assert!(
+        body_b_recv.contains(secret_b),
+        "response B is missing its own secret ({secret_b}). \
+         Got: {body_b_recv}"
+    );
+    assert!(
+        !body_b_recv.contains(secret_a),
+        "response B leaked request A's secret ({secret_a}) under HTTPS CONNECT. \
+         Got: {body_b_recv}"
+    );
+    assert!(
+        !body_a_recv.contains("\u{ab}SECRET_"),
+        "placeholder leaked into response A over CONNECT: {body_a_recv}"
+    );
+    assert!(
+        !body_b_recv.contains("\u{ab}SECRET_"),
+        "placeholder leaked into response B over CONNECT: {body_b_recv}"
+    );
+
+    let _ = shutdown_tx.send(());
+    Ok(())
+}
+
 /// Same end-to-end injection contract as the OpenAI Chat test, but
 /// scoped to the Responses API wire shape. The injector sets the
 /// top-level `instructions` string field (NOT a `messages` entry —
@@ -806,6 +1082,126 @@ async fn collect_h2_body(mut body: h2::RecvStream) -> Result<String> {
         buf.extend_from_slice(&chunk);
     }
     Ok(String::from_utf8(buf)?)
+}
+
+/// Spawn an HTTPS-only HTTP/2 upstream that echoes the request body
+/// back in a small JSON envelope. Returns the bound `SocketAddr` and
+/// the PEM-encoded self-signed leaf cert the client must trust.
+///
+/// Used by the CONNECT-tunnelled H2 multiplex test:
+/// `mitm_isolates_concurrent_h2_streams_under_https_connect_tunnel`.
+///
+/// Why not axum: we need server-side TLS termination AND a known
+/// pipeline-of-one (rustls server → h2 server) so we can echo
+/// per-stream. Axum's HTTP/2 server would work but adds dependencies
+/// we'd then have to coax into accepting our self-signed cert; doing
+/// the rustls + h2 layers directly is shorter and keeps the test
+/// honest about what it exercises.
+async fn spawn_h2_tls_echoing_upstream(sni_name: &'static str) -> Result<(SocketAddr, Vec<u8>)> {
+    use hudsucker::rcgen::generate_simple_self_signed;
+    use tokio_rustls::TlsAcceptor;
+    use tokio_rustls::rustls::ServerConfig;
+
+    // Idempotent — proxy_mitm::run_proxy installs this too, but the
+    // test's rustls server might come up before the proxy does.
+    proxy_mitm_ensure_rustls_provider();
+
+    // rcgen's `generate_simple_self_signed` mints a leaf with the
+    // given SANs and a self-signed signing key. We use the leaf as
+    // a "root" on the client side (rustls accepts self-signed leaves
+    // as roots) — keeps the test cert chain trivially one-deep.
+    let cert_kit = generate_simple_self_signed(vec![sni_name.to_string()])
+        .map_err(|e| anyhow::anyhow!("generate upstream cert: {e}"))?;
+    let cert_pem = cert_kit.cert.pem().into_bytes();
+    let cert_der = cert_kit.cert.der().clone();
+    let key_der: tokio_rustls::rustls::pki_types::PrivateKeyDer<'static> =
+        cert_kit.signing_key.into();
+
+    let mut server_config = ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(vec![cert_der], key_der)
+        .map_err(|e| anyhow::anyhow!("server config: {e}"))?;
+    // Negotiate HTTP/2 ALPN — the whole reason this upstream exists
+    // is to exercise the H2 path end-to-end through the proxy.
+    server_config.alpn_protocols = vec![b"h2".to_vec()];
+    let tls_acceptor = TlsAcceptor::from(Arc::new(server_config));
+
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+
+    tokio::spawn(async move {
+        loop {
+            let Ok((tcp, _)) = listener.accept().await else {
+                break;
+            };
+            let acceptor = tls_acceptor.clone();
+            tokio::spawn(async move {
+                let tls = match acceptor.accept(tcp).await {
+                    Ok(t) => t,
+                    Err(_) => return,
+                };
+                let mut h2 = match h2::server::handshake(tls).await {
+                    Ok(h) => h,
+                    Err(_) => return,
+                };
+                while let Some(req) = h2.accept().await {
+                    let (request, mut respond) = match req {
+                        Ok(r) => r,
+                        Err(_) => continue,
+                    };
+                    tokio::spawn(async move {
+                        // Drain the request body. Echo it back in the
+                        // response so the proxy's outbound-side
+                        // placeholder substitution shows up in the
+                        // response body — same shape the plain-H2 test
+                        // uses to make the cross-stream race visible.
+                        let mut body = request.into_body();
+                        let mut buf = Vec::new();
+                        while let Some(data) = body.data().await {
+                            let Ok(data) = data else { return };
+                            let _ = body.flow_control().release_capacity(data.len());
+                            buf.extend_from_slice(&data);
+                        }
+                        let echoed = String::from_utf8_lossy(&buf).into_owned();
+                        let envelope = serde_json::json!({
+                            "id": "msg_echo",
+                            "type": "message",
+                            "content": [{"type": "text", "text": echoed}],
+                        });
+                        let envelope_bytes = serde_json::to_vec(&envelope).unwrap_or_default();
+                        let response = http::Response::builder()
+                            .status(200)
+                            .header("content-type", "application/json")
+                            .body(())
+                            .unwrap();
+                        let Ok(mut send) = respond.send_response(response, false) else {
+                            return;
+                        };
+                        let _ = send.send_data(bytes::Bytes::from(envelope_bytes), true);
+                    });
+                }
+            });
+        }
+    });
+
+    Ok((addr, cert_pem))
+}
+
+/// Mirror of `proxy_mitm::ensure_rustls_provider` (which is
+/// `pub(crate)` in the lib). The test harness needs to install the
+/// process-default rustls crypto provider BEFORE the rustls server
+/// in `spawn_h2_tls_echoing_upstream` is constructed — without this
+/// the server-side `ServerConfig::builder()` panics on rustls 0.23.
+/// `proxy_mitm::run_proxy` also installs the provider, but the test
+/// upstream may come up first, so we re-install here defensively.
+/// `install_default` is idempotent (returns Err after the first
+/// call; we ignore that).
+fn proxy_mitm_ensure_rustls_provider() {
+    use hudsucker::rustls::crypto::aws_lc_rs;
+    static INIT: std::sync::Once = std::sync::Once::new();
+    INIT.call_once(|| {
+        let _ = aws_lc_rs::default_provider().install_default();
+    });
 }
 
 /// Upstream that echoes the request body back inside a JSON response.
@@ -1028,6 +1424,88 @@ async fn spawn_proxy(
             let _ = shutdown_rx.await;
         })
         .await;
+    });
+    wait_for_listener(addr).await?;
+    Ok((addr, shutdown_tx))
+}
+
+/// Variant of `spawn_proxy` that wires a custom HTTPS upstream
+/// connector trusting an extra root cert.
+///
+/// `proxy_mitm::run_proxy` uses `Proxy::builder().with_rustls_connector(...)`,
+/// which (per hudsucker 0.24's `builder.rs:139`)
+/// hard-wires webpki_roots — the public CA roots only. That works
+/// in production where Anthropic/OpenAI/etc. present public-CA-signed
+/// certs, but the integration test below needs the proxy to dial a
+/// self-signed test upstream. We can't get there through `run_proxy`
+/// without changing production code, so this helper assembles the
+/// hudsucker proxy by hand with `with_http_connector` + a custom
+/// hyper-rustls connector that ALSO trusts the test cert.
+///
+/// This is test-only by design — the production proxy must keep its
+/// "webpki roots only" stance so a misconfigured upstream cert
+/// stays a hard error.
+async fn spawn_proxy_trusting_upstream(
+    ca: hudsucker::certificate_authority::RcgenAuthority,
+    handler: AichuHandler,
+    extra_root_pem: &[u8],
+) -> Result<(SocketAddr, oneshot::Sender<()>)> {
+    use hudsucker::Proxy;
+    use hudsucker::rustls::ClientConfig as RustlsClientConfig;
+    use hudsucker::rustls::crypto::aws_lc_rs;
+
+    // Same idempotent install as `run_proxy` does — required before
+    // any rustls ClientConfig construction on rustls 0.23.
+    proxy_mitm_ensure_rustls_provider();
+
+    // Trust ONLY the test cert. The test upstream is the only
+    // server the proxy ever dials from this spawner. Skipping
+    // webpki defaults keeps the test's dependency footprint
+    // minimal (no `webpki-roots` crate) and makes any "did we
+    // accidentally trust the public web?" mistake immediately
+    // observable as a connect failure.
+    let mut root_store = hudsucker::rustls::RootCertStore::empty();
+    let mut cursor = std::io::Cursor::new(extra_root_pem);
+    for cert in rustls_pemfile::certs(&mut cursor) {
+        let cert = cert.map_err(|e| anyhow::anyhow!("parse extra root PEM: {e}"))?;
+        root_store
+            .add(cert)
+            .map_err(|e| anyhow::anyhow!("add extra root to store: {e}"))?;
+    }
+
+    let rustls_config = RustlsClientConfig::builder_with_provider(Arc::new(
+        aws_lc_rs::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .map_err(|e| anyhow::anyhow!("rustls protocol versions: {e}"))?
+    .with_root_certificates(root_store)
+    .with_no_client_auth();
+
+    let https = hyper_rustls::HttpsConnectorBuilder::new()
+        .with_tls_config(rustls_config)
+        .https_or_http()
+        .enable_http1()
+        .enable_http2()
+        .build();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    drop(listener);
+
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+    let proxy = Proxy::builder()
+        .with_addr(addr)
+        .with_ca(ca)
+        .with_http_connector(https)
+        .with_http_handler(handler)
+        .with_graceful_shutdown(async move {
+            let _ = shutdown_rx.await;
+        })
+        .build()
+        .map_err(|e| anyhow::anyhow!("build test proxy: {e}"))?;
+
+    tokio::spawn(async move {
+        let _ = proxy.start().await;
     });
     wait_for_listener(addr).await?;
     Ok((addr, shutdown_tx))
