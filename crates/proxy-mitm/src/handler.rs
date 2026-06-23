@@ -58,7 +58,7 @@ use hudsucker::{
         header::{ACCEPT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE},
     },
 };
-use proxy_core::{InjectionShape, PlaceholderMap, SseReverser};
+use proxy_core::{Finding, InjectionShape, PlaceholderMap, SseReverser};
 
 #[derive(Clone)]
 pub struct AichuHandler {
@@ -77,6 +77,12 @@ pub struct AichuHandler {
     /// 12% to 96% on gpt-5-mini. The CLI's `--no-system-prompt`
     /// flag toggles this off; see `crates/cli/src/main.rs`.
     inject_system_prompt: bool,
+    /// Whether to log a per-kind detector tally (`AWS_KEY×1, JWT×2`) for
+    /// each forwarded request that tripped a detector. Default OFF; the
+    /// CLI's `--report` flag turns it on. When on, `handle_request` does a
+    /// second `proxy_core::scan` pass to build the tally — paid only in
+    /// report mode, so the default path keeps its single redact pass.
+    report: bool,
 }
 
 impl Default for AichuHandler {
@@ -87,6 +93,9 @@ impl Default for AichuHandler {
             // Default ON — see the field doc comment for the rationale
             // (and crates/cli/src/main.rs::Run for the flag wiring).
             inject_system_prompt: true,
+            // Default OFF — opt-in via `--report`; adds a scan pass per
+            // request when enabled.
+            report: false,
         }
     }
 }
@@ -104,6 +113,15 @@ impl AichuHandler {
     /// `AichuHandler::new()`.
     pub fn with_inject_system_prompt(mut self, on: bool) -> Self {
         self.inject_system_prompt = on;
+        self
+    }
+
+    /// Toggle per-request detector reporting on or off. Defaults to OFF
+    /// via `AichuHandler::new`; the CLI's `--report` flag flips it on.
+    /// Returns `self` for builder-style chaining next to
+    /// `with_inject_system_prompt`.
+    pub fn with_report(mut self, on: bool) -> Self {
+        self.report = on;
         self
     }
 
@@ -215,6 +233,23 @@ fn inject_after_redact(body_str: &str, shape: Option<InjectionShape>) -> String 
     }
 }
 
+/// Tally findings by detector kind into a compact, deterministic summary
+/// like `AWS_KEY×1, JWT×2`. Sorted by kind slug (`BTreeMap`) so the logged
+/// line is stable across runs — `HashMap` iteration order would make the
+/// report jitter between requests. Kinds and counts only; never the
+/// secret values. Used by the opt-in `--report` path in `handle_request`.
+fn summarize_kinds(findings: &[Finding]) -> String {
+    let mut counts: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    for f in findings {
+        *counts.entry(f.kind.to_string()).or_insert(0) += 1;
+    }
+    counts
+        .iter()
+        .map(|(kind, n)| format!("{kind}×{n}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 impl HttpHandler for AichuHandler {
     async fn handle_request(
         &mut self,
@@ -269,6 +304,15 @@ impl HttpHandler for AichuHandler {
                         placeholders = map.len(),
                         "redacted outbound body before forwarding upstream",
                     );
+                    if self.report {
+                        // Opt-in detector report (`aichu run --report`).
+                        // Re-scan to recover the per-kind tally — done only
+                        // when the user asked for it, so the default hot
+                        // path keeps its single redact pass. Logs kinds +
+                        // counts only, never the secret values.
+                        let detectors = summarize_kinds(&proxy_core::scan(s));
+                        tracing::info!(%detectors, "detectors fired (--report)");
+                    }
                 }
                 let final_body = if self.inject_system_prompt {
                     inject_after_redact(&redacted, inject_shape)
@@ -533,6 +577,53 @@ mod tests {
             on_again.inject_system_prompt,
             "with_inject_system_prompt(true) must restore the field",
         );
+    }
+
+    /// Construct a `Finding` carrying only a kind — `summarize_kinds` reads
+    /// nothing else, so start/end/text are zeroed.
+    fn finding(kind: SecretKind) -> Finding {
+        Finding {
+            kind,
+            start: 0,
+            end: 0,
+            text: String::new(),
+        }
+    }
+
+    #[test]
+    fn with_report_toggles_the_field_and_defaults_off() {
+        // Mirrors `with_inject_system_prompt_toggles_the_field`. Default OFF
+        // is load-bearing: report mode adds a second scan pass per request,
+        // so it must never be on unless the user passed `--report`.
+        assert!(!AichuHandler::new().report, "report must default OFF");
+        let on = AichuHandler::new().with_report(true);
+        assert!(on.report, "with_report(true) must set the field");
+        assert!(
+            !on.with_report(false).report,
+            "with_report(false) must clear the field",
+        );
+    }
+
+    #[test]
+    fn summarize_kinds_tallies_per_kind_and_sorts_by_slug() {
+        // Two JWTs + one AWS key → "AWS_KEY×1, JWT×2". The ordering is
+        // alphabetical by slug (BTreeMap), NOT finding order, so the logged
+        // report line is deterministic. A switch to HashMap would make this
+        // flaky — that's exactly what this pins.
+        let findings = vec![
+            finding(SecretKind::Jwt),
+            finding(SecretKind::AwsAccessKey),
+            finding(SecretKind::Jwt),
+        ];
+        assert_eq!(summarize_kinds(&findings), "AWS_KEY×1, JWT×2");
+    }
+
+    #[test]
+    fn summarize_kinds_is_empty_for_no_findings() {
+        // The report log is only emitted when the map is non-empty, but
+        // pin the empty case anyway so a future caller can't get a stray
+        // ", " or panic on an empty slice.
+        assert_eq!(summarize_kinds(&[]), "");
     }
 
     #[test]

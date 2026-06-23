@@ -12,6 +12,7 @@ publish = false
 
 [dependencies]
 proxy-mitm = { path = "../proxy-mitm" }
+proxy-core = { path = "../proxy-core" }
 clap = { workspace = true }
 tokio = { workspace = true }
 anyhow = { workspace = true }

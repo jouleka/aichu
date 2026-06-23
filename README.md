@@ -42,6 +42,18 @@ export HTTPS_PROXY=http://127.0.0.1:8788
 export NODE_EXTRA_CA_CERTS=$HOME/.aichu/ca/aichu-ca.pem
 claude         # or codex, opencode, cursor-agent, etc.
 
+# Dry run: report which detectors WOULD fire on a file (or stdin) without
+# starting the proxy or sending anything upstream. Exit code is 0 (clean),
+# 2 (secrets found), or 1 (read error) — usable in CI / pre-commit hooks.
+# Output names the detector, location, and placeholder — never the secret.
+aichu scan .env
+cat config.yaml | aichu scan
+
+# See which detectors fire on live traffic: add --report to `run`. Logs a
+# per-request kind tally (e.g. `AWS_KEY×1, JWT×2`) — kinds and counts only,
+# never the secret values.
+aichu run --report
+
 # Troubleshooting:
 aichu doctor   # diagnoses CA, trust-store install, HTTPS_PROXY, and proxy-port issues
 
@@ -88,7 +100,7 @@ aichu/
 - `crates/proxy-core/`   — redaction pipeline, placeholder map (shared) ✅ shipped
 - `crates/proxy-mitm/`   — Mode B: Hudsucker MITM ✅ shipped
 - `crates/proxy-server/` — Mode A: localhost HTTP server, base-URL relay ✅ shipped
-- `crates/cli/`          — `aichu run | trust | untrust | doctor` ✅ shipped (macOS + Linux (Debian, Red Hat, and Arch families) + Windows (per-user `CurrentUser\Root`))
+- `crates/cli/`          — `aichu run | scan | trust | untrust | doctor` ✅ shipped (macOS + Linux (Debian, Red Hat, and Arch families) + Windows (per-user `CurrentUser\Root`))
 
 ## v0 scope: CLI tools only
 
@@ -112,8 +124,12 @@ Linux, macOS Network Extension) — a future investment, not a v0 feature.
 ### What aichu protects against
 
 A specific, narrow class of accidental leakage: **secret-shaped substrings in
-prompts you send to AI coding agents**. Concretely: you paste an `.env` file,
-a stack trace, or a code snippet into Claude Code; without aichu, the bytes
+the prompt traffic your AI coding agent sends upstream**. This is broader than
+just what you type: aichu redacts the *entire* outbound request body on known
+prompt endpoints, so a secret is caught whether it rides in a prompt you typed,
+a pasted `.env` file, a stack trace, a code snippet, **or a tool result the
+agent fed back to the model** (command output, a file it read into context).
+Without aichu, the bytes
 (including any embedded API key, OAuth token, AWS credential, JWT, Slack
 token, etc.) flow verbatim to Anthropic / OpenAI / etc. With aichu running,
 those substrings are replaced with typed placeholders like

@@ -5,6 +5,7 @@
 //
 // v0 surface:
 //   - `aichu` / `aichu run`   — start the proxy (default)
+//   - `aichu scan [FILE]`     — offline dry run: report which detectors fire
 //   - `aichu trust`           — install the local CA into the OS trust store
 //   - `aichu untrust`         — remove the local CA from the OS trust store
 //   - `aichu doctor`          — diagnose common setup issues
@@ -21,11 +22,13 @@
 use std::ffi::OsString;
 use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, ExitCode};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+
+mod scan;
 
 /// Local HTTPS proxy that redacts secrets from prompts sent to AI coding
 /// agents, then restores them in responses.
@@ -44,6 +47,14 @@ enum Commands {
     /// bodies (default ON; the e03 eval measured it lifts secret-
     /// placeholder echo accuracy from 12% to 96% on gpt-5-mini).
     Run(RunArgs),
+    /// Scan a file (or stdin) for secrets and report which detectors would
+    /// fire, then exit — a local dry run. Never opens a socket and never
+    /// writes to disk: it answers "would aichu catch the secret in this
+    /// text?" without routing any traffic. Exit code is `0` (clean), `2`
+    /// (at least one detector fired), or `1` (the input could not be read),
+    /// so CI and pre-commit hooks can gate on it. Output names the
+    /// detector, location, and placeholder — never the secret bytes.
+    Scan(scan::ScanArgs),
     /// Install the local CA into the OS trust store (macOS System keychain,
     /// Linux Debian/Red Hat/Arch families [requires sudo], or Windows
     /// per-user `CurrentUser\Root` via certutil [no UAC]).
@@ -70,6 +81,14 @@ struct RunArgs {
     /// preservation on gpt-5-mini.
     #[arg(long, default_value_t = false)]
     no_system_prompt: bool,
+
+    /// Log which detector kinds fired on each forwarded request (e.g.
+    /// `AWS_KEY×1, JWT×2`), on top of the default placeholder count.
+    /// Reports kinds and counts only — never the secret values — and only
+    /// for requests that actually tripped a detector. Off by default; the
+    /// extra per-request `scan` pass is paid only when this is set.
+    #[arg(long, default_value_t = false)]
+    report: bool,
 }
 
 impl Cli {
@@ -80,19 +99,45 @@ impl Cli {
     fn command(&self) -> Commands {
         self.command
             .clone()
-            .unwrap_or(Commands::Run(RunArgs { no_system_prompt: false }))
+            .unwrap_or(Commands::Run(RunArgs { no_system_prompt: false, report: false }))
     }
 }
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() -> ExitCode {
     init_tracing();
     let cli = Cli::parse();
     match cli.command() {
-        Commands::Run(args) => run(args).await,
-        Commands::Trust => handle_trust(),
-        Commands::Untrust => handle_untrust(),
-        Commands::Doctor => handle_doctor(),
+        // `scan` returns its OWN ExitCode so it can signal "secrets found"
+        // as code 2, distinct from the code-1 "a handler errored" that
+        // `to_exit_code` produces. See `scan::EXIT_SECRETS_FOUND`.
+        Commands::Scan(args) => scan::handle_scan(args),
+        Commands::Run(args) => to_exit_code(run(args).await),
+        Commands::Trust => to_exit_code(handle_trust()),
+        Commands::Untrust => to_exit_code(handle_untrust()),
+        Commands::Doctor => to_exit_code(handle_doctor()),
+    }
+}
+
+/// Map a handler's `Result<()>` to a process exit code, printing the
+/// anyhow error to stderr on failure.
+///
+/// `main` returns `ExitCode` (not `Result<()>`) so `scan` can carry its
+/// own verdict code (exit 2 = secrets found). This adapter preserves the
+/// prior EXIT behavior for every other handler — Ok → 0, Err → nonzero
+/// with the error printed to stderr first. One deliberate change (Rule 7):
+/// the previous `#[tokio::main] async fn main() -> Result<()>` printed the
+/// error via `Termination`'s Debug form (`{e:?}`); this prints the anyhow
+/// Display chain (`{e:#}`) instead — same exit code (1, via `FAILURE`),
+/// strictly more legible output. The tokio runtime and `run`'s ctrl_c
+/// shutdown are unchanged.
+fn to_exit_code(result: Result<()>) -> ExitCode {
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("Error: {e:#}");
+            ExitCode::FAILURE
+        }
     }
 }
 
@@ -131,10 +176,16 @@ async fn run(args: RunArgs) -> Result<()> {
     // when constructing the handler.
     let inject_system_prompt = !args.no_system_prompt;
     let handler = proxy_mitm::handler::AichuHandler::new()
-        .with_inject_system_prompt(inject_system_prompt);
+        .with_inject_system_prompt(inject_system_prompt)
+        .with_report(args.report);
     if !inject_system_prompt {
         tracing::info!(
             "preserve-tokens system prompt injection disabled (--no-system-prompt)",
+        );
+    }
+    if args.report {
+        tracing::info!(
+            "detector reporting enabled (--report): per-request kind tallies will be logged",
         );
     }
 
@@ -1088,6 +1139,18 @@ mod tests {
     }
 
     #[test]
+    fn run_with_report_flag_sets_field_true() {
+        // Pin: `aichu run --report` flips the report field. A regression
+        // dropping or renaming the flag would silently leave detector
+        // reporting off for users who explicitly asked for it.
+        let cli = Cli::parse_from(["aichu", "run", "--report"]);
+        match cli.command() {
+            Commands::Run(args) => assert!(args.report, "--report should set report to true"),
+            other => panic!("expected Commands::Run, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn run_default_keeps_system_prompt_on() {
         // Pin the default-ON contract explicitly: `aichu run` with
         // no flags must NOT set `no_system_prompt`. Belt-and-
@@ -1097,6 +1160,30 @@ mod tests {
         match cli.command() {
             Commands::Run(args) => assert!(!args.no_system_prompt),
             other => panic!("expected Commands::Run, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn scan_subcommand_parses_a_file_argument() {
+        // `aichu scan <path>` routes to Scan with the file captured. A
+        // regression renaming the positional or the variant would silently
+        // break the dry-run entry point — this pins both.
+        let cli = Cli::parse_from(["aichu", "scan", "secrets.env"]);
+        match cli.command() {
+            Commands::Scan(args) => assert_eq!(args.file.as_deref(), Some("secrets.env")),
+            other => panic!("expected Commands::Scan, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn scan_subcommand_defaults_file_to_none_for_stdin() {
+        // Bare `aichu scan` (no path) must leave `file` None so
+        // `scan::read_scan_input` reads stdin. Pins the stdin-by-default
+        // contract the `cat ... | aichu scan` usage depends on.
+        let cli = Cli::parse_from(["aichu", "scan"]);
+        match cli.command() {
+            Commands::Scan(args) => assert!(args.file.is_none()),
+            other => panic!("expected Commands::Scan, got {other:?}"),
         }
     }
 
