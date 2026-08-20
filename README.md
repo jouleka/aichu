@@ -1,123 +1,131 @@
 # aichu
 
-Local Rust proxy that redacts secrets from prompts sent to AI coding agents (Claude Code, Codex, OpenCode, Cursor CLI), then restores them in responses.
+**Keep credentials out of AI coding-agent traffic without breaking the conversation.**
 
-> **Status:** Week 1 risks validated. Production code shipped: `crates/proxy-core` (redaction), `crates/proxy-mitm` (Mode B), `crates/proxy-server` (Mode A), `crates/cli` (the `aichu` binary). End-to-end redaction round-trip works against real Anthropic traffic through both proxy modes. See [Threat model](#threat-model) for guarantees + known limitations.
+`aichu` is a local Rust proxy and offline scanner. It detects secret-shaped
+values in outbound prompt traffic, swaps them for typed placeholders, and
+restores those values locally when the model echoes the placeholders back.
+The provider receives the useful context—not the credential itself.
 
-## Why this exists
+> **Current status:** working v0 CLI for macOS, Linux, and Windows. The MITM
+> proxy, base-URL relay, redaction core, offline scanner, trust management,
+> and diagnostics are implemented and tested. Install from source; the crate
+> is not published to crates.io yet.
 
-AI coding agents have access to your entire workspace, including files containing API keys, tokens, and credentials. When you ask an agent a question, those secrets can be sent verbatim to the model provider. This proxy sits between the agent and the model provider, detects secrets in outbound prompts, replaces them with reversible placeholders, and restores them in the streamed response.
+## The product in one request
 
-See [`docs/build-plan.md`](docs/build-plan.md) for the full architectural plan, prior art, and competitive landscape.
+```text
+coding agent             aichu on localhost                model provider
+────────────             ──────────────────                ──────────────
+"debug sk-live-…"  ───▶  detect + replace            ───▶  "debug «SECRET_…»"
+"check sk-live-…"  ◀───  restore preserved token     ◀───  "check «SECRET_…»"
+```
 
-## Week 1 goals (validate before building)
+The placeholder map stays in memory. Original secret bytes are not written to
+disk, logged, or sent upstream. Detection covers the complete request body on
+known prompt endpoints, including pasted files and tool output returned to the
+model—not only text typed directly by the user.
 
-The build plan identifies three risks that must be validated before committing to an architecture. Each gets its own experiment crate:
-
-| Experiment | Risk | Kill criteria |
-|---|---|---|
-| [`e01-hudsucker-mitm`](experiments/e01-hudsucker-mitm) | Can we MITM real coding agents (cert pinning, HTTP/2, SSE)? | Cannot MITM Claude Code CLI streaming end-to-end in 2 days → pivot to Mode A only |
-| [`e02-base-url-relay`](experiments/e02-base-url-relay) | Does the no-MITM base-URL approach work for Aider / OpenCode / Codex / Claude Code? | Cannot relay streaming `/v1/messages` with intact SSE → architecture is broken |
-| [`e03-placeholder-eval`](experiments/e03-placeholder-eval) | Do LLMs preserve placeholder tokens verbatim across families? | No format > 95% verbatim preservation on prefix-typed secrets → reversible-redaction concept is fragile |
-
-Each experiment's README records its goal, run instructions, and result (✅/❌ with notes) as it completes.
-
-## Running aichu
+## Quick start
 
 ```bash
-# Build + install the binary.
+git clone https://github.com/jouleka/aichu.git
+cd aichu
 cargo install --path crates/cli
 
-# One-time: install the local CA into the OS trust store.
-# (sudo prompts for your login password on macOS + Linux (Debian, Red Hat,
-#  and Arch families); Windows installs into per-user CurrentUser\Root via
-#  certutil with no UAC prompt.)
+# One-time: generate and trust a local CA for the HTTPS proxy.
 aichu trust
 
-# Run the proxy. Listens on 127.0.0.1:8788; Ctrl-C to stop.
-aichu          # equivalent to `aichu run`
-
-# In another shell, point a coding agent at the proxy.
-export HTTPS_PROXY=http://127.0.0.1:8788
-export NODE_EXTRA_CA_CERTS=$HOME/.aichu/ca/aichu-ca.pem
-claude         # or codex, opencode, cursor-agent, etc.
-
-# Dry run: report which detectors WOULD fire on a file (or stdin) without
-# starting the proxy or sending anything upstream. Exit code is 0 (clean),
-# 2 (secrets found), or 1 (read error) — usable in CI / pre-commit hooks.
-# Output names the detector, location, and placeholder — never the secret.
-aichu scan .env
-cat config.yaml | aichu scan
-
-# See which detectors fire on live traffic: add --report to `run`. Logs a
-# per-request kind tally (e.g. `AWS_KEY×1, JWT×2`) — kinds and counts only,
-# never the secret values.
+# Start the proxy on 127.0.0.1:8788.
 aichu run --report
-
-# Troubleshooting:
-aichu doctor   # diagnoses CA, trust-store install, HTTPS_PROXY, and proxy-port issues
-
-# To clean up:
-aichu untrust  # remove CA from the OS trust store
-rm -rf ~/.aichu  # remove cert + key files
 ```
 
-## Running an experiment
-
-Only `e03-placeholder-eval` remains in `experiments/` — `e01` and `e02`
-have graduated to `crates/proxy-mitm/` and `crates/proxy-server/`
-respectively. To run the placeholder-preservation harness:
+Point a CLI agent at the proxy from another shell:
 
 ```bash
-cd experiments/e03-placeholder-eval
-cargo run --release
+export HTTPS_PROXY=http://127.0.0.1:8788
+export NODE_EXTRA_CA_CERTS="$HOME/.aichu/ca/aichu-ca.pem"
+
+claude # or codex, opencode, cursor-agent
 ```
 
-Workspace-level `cargo build` builds everything.
+`aichu doctor` checks the CA, trust-store installation, proxy environment,
+and listening port. When you are finished, `aichu untrust` removes the CA
+from the OS trust store.
 
-## Project structure
+## Scan before anything leaves the machine
 
-```
-aichu/
-├── Cargo.toml              # workspace root
-├── rust-toolchain.toml     # pinned stable toolchain
-├── CLAUDE.md               # 12-rule project guidelines
-├── docs/
-│   └── build-plan.md       # full architectural plan
-├── crates/
-│   ├── proxy-core/         # detection + redaction + reverse (used by both modes)
-│   ├── proxy-mitm/         # Mode B: HTTPS MITM with on-the-fly rcgen CA (graduated from e01)
-│   ├── proxy-server/       # Mode A: localhost HTTP server, base-URL relay (graduated from e02)
-│   └── cli/                # the `aichu` binary
-└── experiments/            # week-1 risk-validation crates
-    ├── e01-hudsucker-mitm/ # historical record only (code graduated to crates/proxy-mitm)
-    ├── e02-base-url-relay/ # historical record only (code graduated to crates/proxy-server)
-    └── e03-placeholder-eval/  # harness for measuring placeholder preservation
+The scanner uses the same detection core without opening a socket:
+
+```bash
+aichu scan .env
+cat config.yaml | aichu scan
 ```
 
-## Eventual production layout (in progress)
+It reports detector names, locations, and generated placeholders—never the
+secret bytes. Exit codes make it usable in CI and pre-commit hooks:
 
-- `crates/proxy-core/`   — redaction pipeline, placeholder map (shared) ✅ shipped
-- `crates/proxy-mitm/`   — Mode B: Hudsucker MITM ✅ shipped
-- `crates/proxy-server/` — Mode A: localhost HTTP server, base-URL relay ✅ shipped
-- `crates/cli/`          — `aichu run | scan | trust | untrust | doctor` ✅ shipped (macOS + Linux (Debian, Red Hat, and Arch families) + Windows (per-user `CurrentUser\Root`))
+| Exit | Meaning |
+|---:|---|
+| `0` | No detector fired |
+| `1` | Input could not be read |
+| `2` | At least one secret-shaped value was detected |
 
-## v0 scope: CLI tools only
+## Supported surfaces
 
-Validated empirically against six real coding-agent surfaces (see
-[e01 README → Manual smoke test](experiments/e01-hudsucker-mitm/README.md#manual-smoke-test-2026-05-15)),
-aichu v0 ships for:
+| Surface | v0 route | Status |
+|---|---|---|
+| Claude Code CLI | `HTTPS_PROXY` + `NODE_EXTRA_CA_CERTS` | Validated |
+| Codex CLI | Proxy variables or a custom model provider | Validated |
+| OpenCode | Proxy variables / base URL | Validated |
+| Cursor CLI (`cursor-agent`) | Proxy variables after login | Validated |
 
-- **Claude Code CLI** — `HTTPS_PROXY` + `NODE_EXTRA_CA_CERTS`
-- **Codex CLI** — same env vars, or `[model_providers]` in `~/.codex/config.toml`
-- **OpenCode** (Bun) — same env vars
-- **Cursor CLI** (`cursor-agent`) — same env vars (requires `cursor-agent login`)
+Cursor IDE and Claude Desktop are intentionally out of scope for v0. Their
+Chromium network paths do not reliably honor the CLI proxy configuration on
+macOS; supporting them requires transparent capture rather than pretending the
+current proxy can see traffic that bypasses it.
 
-**Out of scope for v0:** Cursor IDE and Claude Desktop. Both put their chat
-path in Chromium's network service, which on macOS doesn't read `HTTPS_PROXY`
-and routes chat traffic via a separate process holding direct TCP
-connections. Reaching them requires Mode C / transparent capture (eBPF on
-Linux, macOS Network Extension) — a future investment, not a v0 feature.
+## Architecture
+
+| Component | Responsibility |
+|---|---|
+| `proxy-core` | Secret detection, typed placeholders, and in-memory reversal |
+| `proxy-mitm` | HTTPS proxy with a locally generated CA and streaming support |
+| `proxy-server` | Base-URL relay for clients that can target a local endpoint |
+| `cli` | `run`, `scan`, `trust`, `untrust`, and `doctor` |
+
+The v0 CLI starts the MITM route. The base-URL relay is implemented as a
+separate crate for integrations that do not need a trusted local CA.
+
+```text
+crates/
+├── cli/          # user-facing binary
+├── proxy-core/   # shared detection and reversal pipeline
+├── proxy-mitm/   # HTTPS interception mode
+└── proxy-server/ # base-URL relay mode
+```
+
+## Development
+
+```bash
+cargo build --workspace
+cargo test --workspace
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+```
+
+The repository began with three explicit risk experiments. Their READMEs keep
+the original hypotheses and results:
+
+- [`e01-hudsucker-mitm`](experiments/e01-hudsucker-mitm) — real-agent MITM,
+  HTTP/2, and SSE feasibility
+- [`e02-base-url-relay`](experiments/e02-base-url-relay) — no-MITM relay and
+  streaming integrity
+- [`e03-placeholder-eval`](experiments/e03-placeholder-eval) — how reliably
+  model families preserve reversible placeholder tokens
+
+See [`docs/build-plan.md`](docs/build-plan.md) for the original architecture,
+prior-art review, and validation plan.
 
 ## Threat model
 
