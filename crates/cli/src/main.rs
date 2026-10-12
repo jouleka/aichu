@@ -830,10 +830,7 @@ where
     F: Fn(&str) -> Option<OsString>,
 {
     match env("HTTPS_PROXY").or_else(|| env("https_proxy")) {
-        Some(value) => CheckResult::Ok(format!(
-            "HTTPS_PROXY={}",
-            value.to_string_lossy()
-        )),
+        Some(_) => CheckResult::Ok("HTTPS_PROXY is set".into()),
         None => CheckResult::Warn {
             message: "HTTPS_PROXY is not set in this shell".into(),
             hint: "export HTTPS_PROXY=http://127.0.0.1:8788 (the proxy still works for any process that DOES have it set)".into(),
@@ -1710,24 +1707,74 @@ mod tests {
 
     #[test]
     fn check_https_proxy_ok_when_uppercase_var_set() {
-        let r = check_https_proxy(|k| match k {
-            "HTTPS_PROXY" => Some("http://127.0.0.1:8788".into()),
-            _ => None,
+        let lookups = std::cell::RefCell::new(Vec::new());
+        let r = check_https_proxy(|k| {
+            lookups.borrow_mut().push(k.to_string());
+            match k {
+                "HTTPS_PROXY" => {
+                    Some("http://example-user:example-password@proxy.invalid:8080".into())
+                }
+                "https_proxy" => panic!("uppercase setting must take precedence"),
+                _ => None,
+            }
         });
-        assert!(matches!(r, CheckResult::Ok(_)));
+        assert_eq!(lookups.into_inner(), vec!["HTTPS_PROXY"]);
+        assert_eq!(r, CheckResult::Ok("HTTPS_PROXY is set".into()));
+        let rendered = format!("{r:?}");
+        assert!(!rendered.contains("example-user"));
+        assert!(!rendered.contains("example-password"));
+        assert!(!rendered.contains("proxy.invalid"));
     }
 
     #[test]
     fn check_https_proxy_falls_back_to_lowercase_var() {
-        // Many shell environments only set `https_proxy` (lowercase, the
-        // libcurl convention). Coding agents that use libcurl-derived
-        // HTTP clients will read it; doctor must too, or it'd warn about
-        // a setup that actually works.
+        let lookups = std::cell::RefCell::new(Vec::new());
+        let r = check_https_proxy(|k| {
+            lookups.borrow_mut().push(k.to_string());
+            match k {
+                "https_proxy" => {
+                    Some("http://example-user:example-password@proxy.invalid:8080".into())
+                }
+                _ => None,
+            }
+        });
+        assert_eq!(lookups.into_inner(), vec!["HTTPS_PROXY", "https_proxy"]);
+        assert_eq!(r, CheckResult::Ok("HTTPS_PROXY is set".into()));
+        let rendered = format!("{r:?}");
+        assert!(!rendered.contains("example-user"));
+        assert!(!rendered.contains("example-password"));
+        assert!(!rendered.contains("proxy.invalid"));
+    }
+
+    #[test]
+    fn check_https_proxy_accepts_empty_and_malformed_values_without_disclosing_them() {
+        for value in ["", "example-password in a malformed proxy setting"] {
+            let r = check_https_proxy(|k| match k {
+                "HTTPS_PROXY" => Some(value.into()),
+                _ => None,
+            });
+            assert_eq!(r, CheckResult::Ok("HTTPS_PROXY is set".into()));
+            assert!(!format!("{r:?}").contains("example-password"));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn check_https_proxy_does_not_disclose_non_unicode_values() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let mut bytes = b"http://example-user:example-password@proxy.invalid:8080".to_vec();
+        bytes.push(0xff);
+        let value = OsString::from_vec(bytes);
         let r = check_https_proxy(|k| match k {
-            "https_proxy" => Some("http://127.0.0.1:8788".into()),
+            "HTTPS_PROXY" => Some(value.clone()),
             _ => None,
         });
-        assert!(matches!(r, CheckResult::Ok(_)));
+        assert_eq!(r, CheckResult::Ok("HTTPS_PROXY is set".into()));
+        let rendered = format!("{r:?}");
+        assert!(!rendered.contains("example-user"));
+        assert!(!rendered.contains("example-password"));
+        assert!(!rendered.contains("proxy.invalid"));
     }
 
     #[test]
