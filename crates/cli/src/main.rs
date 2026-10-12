@@ -821,10 +821,8 @@ fn check_ca_present(ca_dir: &Path) -> CheckResult {
 /// won't route traffic through aichu — the proxy can be running and
 /// trusted, and prompts will still flow unredacted to the model provider.
 ///
-/// We don't try to parse or validate the URL — heuristic guessing about
-/// "right" URLs would mask real misconfigurations behind opinions. A set
-/// value reports Ok with the value displayed; the user reads it and
-/// decides if it points where they meant.
+/// Report only whether a value is present, because proxy URLs can include
+/// credentials. Presence remains checked without parsing or validating the URL.
 fn check_https_proxy<F>(env: F) -> CheckResult
 where
     F: Fn(&str) -> Option<OsString>,
