@@ -9,23 +9,23 @@
 
 use std::convert::Infallible;
 use std::net::SocketAddr;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use axum::{
-    Router,
     extract::State,
     response::sse::{Event, Sse},
     routing::post,
+    Router,
 };
-use futures_util::{StreamExt, stream};
+use futures_util::{stream, StreamExt};
 use serde_json::json;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::oneshot;
 
-use proxy_server::{RelayConfig, run_relay};
+use proxy_server::{run_relay, RelayConfig};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn relay_streams_anthropic_sse_intact() -> Result<()> {
@@ -112,12 +112,9 @@ async fn relay_streams_openai_chat_completions_chunks_over_time() -> Result<()> 
     // first-byte and last-byte to call this "streaming".
     const STREAMING_SPAN_THRESHOLD: Duration = Duration::from_millis(200);
 
-    let upstream = spawn_test_upstream_with_gap(
-        "/v1/chat/completions",
-        vec!["hello", "world", "done"],
-        GAP,
-    )
-    .await?;
+    let upstream =
+        spawn_test_upstream_with_gap("/v1/chat/completions", vec!["hello", "world", "done"], GAP)
+            .await?;
 
     let config = RelayConfig {
         anthropic_upstream: "http://127.0.0.1:1".to_string(), // unused
@@ -360,9 +357,7 @@ async fn spawn_anthropic_sse_upstream_with_gap(
         Sse::new(s)
     }
 
-    let app = Router::new()
-        .route(path, post(handler))
-        .with_state(state);
+    let app = Router::new().route(path, post(handler)).with_state(state);
 
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;

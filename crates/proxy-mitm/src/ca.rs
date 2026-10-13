@@ -61,8 +61,7 @@ pub fn load_or_create_ca(dir: &Path) -> Result<Ca> {
     };
 
     let key_pair = KeyPair::from_pem(&key_pem).context("parse CA private key")?;
-    let issuer =
-        Issuer::from_ca_cert_pem(&cert_pem, key_pair).context("parse CA certificate")?;
+    let issuer = Issuer::from_ca_cert_pem(&cert_pem, key_pair).context("parse CA certificate")?;
     let authority = RcgenAuthority::new(issuer, 1_000, aws_lc_rs::default_provider());
 
     Ok(Ca {
@@ -72,8 +71,8 @@ pub fn load_or_create_ca(dir: &Path) -> Result<Ca> {
 }
 
 fn generate_ca() -> Result<(String, String)> {
-    let mut params = CertificateParams::new(Vec::<String>::new())
-        .context("init CA certificate params")?;
+    let mut params =
+        CertificateParams::new(Vec::<String>::new()).context("init CA certificate params")?;
     let mut dn = DistinguishedName::new();
     dn.push(DnType::CommonName, COMMON_NAME);
     dn.push(DnType::OrganizationName, "aichu");

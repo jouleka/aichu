@@ -100,10 +100,7 @@ mod tests {
             PlaceholderFormat::Redacted.render("aws_key", 1),
             "[REDACTED]"
         );
-        assert_eq!(
-            PlaceholderFormat::Asterisks.render("aws_key", 1),
-            "***"
-        );
+        assert_eq!(PlaceholderFormat::Asterisks.render("aws_key", 1), "***");
         assert_eq!(
             PlaceholderFormat::Mustache.render("aws_key", 1),
             "{{AWS_KEY}}"

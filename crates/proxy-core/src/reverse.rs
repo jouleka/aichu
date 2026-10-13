@@ -133,7 +133,10 @@ mod tests {
         let map = make_map_with_one_secret(SecretKind::AwsAccessKey, "AKIAIOSFODNN7EXAMPLE");
         let response = "First \u{ab}SECRET_AWS_KEY_001\u{bb}, then \u{ab}SECRET_AWS_KEY_001\u{bb}.";
         let out = reverse(response, &map);
-        assert_eq!(out, "First AKIAIOSFODNN7EXAMPLE, then AKIAIOSFODNN7EXAMPLE.");
+        assert_eq!(
+            out,
+            "First AKIAIOSFODNN7EXAMPLE, then AKIAIOSFODNN7EXAMPLE."
+        );
     }
 
     #[test]

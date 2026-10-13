@@ -97,9 +97,10 @@ impl Cli {
     /// here means tests can assert the defaulting policy without
     /// re-parsing argv shapes.
     fn command(&self) -> Commands {
-        self.command
-            .clone()
-            .unwrap_or(Commands::Run(RunArgs { no_system_prompt: false, report: false }))
+        self.command.clone().unwrap_or(Commands::Run(RunArgs {
+            no_system_prompt: false,
+            report: false,
+        }))
     }
 }
 
@@ -144,8 +145,7 @@ fn to_exit_code(result: Result<()>) -> ExitCode {
 fn init_tracing() {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
 }
@@ -179,9 +179,7 @@ async fn run(args: RunArgs) -> Result<()> {
         .with_inject_system_prompt(inject_system_prompt)
         .with_report(args.report);
     if !inject_system_prompt {
-        tracing::info!(
-            "preserve-tokens system prompt injection disabled (--no-system-prompt)",
-        );
+        tracing::info!("preserve-tokens system prompt injection disabled (--no-system-prompt)",);
     }
     if args.report {
         tracing::info!(
@@ -235,7 +233,10 @@ fn handle_trust() -> Result<()> {
 /// nuked `~/.aichu/`.
 #[cfg(target_os = "macos")]
 fn handle_untrust() -> Result<()> {
-    let mut cmd = untrust_command(proxy_mitm::ca::COMMON_NAME, Path::new(MACOS_SYSTEM_KEYCHAIN));
+    let mut cmd = untrust_command(
+        proxy_mitm::ca::COMMON_NAME,
+        Path::new(MACOS_SYSTEM_KEYCHAIN),
+    );
     tracing::info!(
         "removing CA \"{}\" — sudo will prompt for your login password",
         proxy_mitm::ca::COMMON_NAME
@@ -349,7 +350,10 @@ fn handle_trust() -> Result<()> {
             );
             run_or_bail(&mut cp, "CA copy")?;
             let mut upd = linux_family_refresh_command(fam);
-            tracing::info!("rebuilding system trust bundle ({})...", linux_family_refresh_label(fam));
+            tracing::info!(
+                "rebuilding system trust bundle ({})...",
+                linux_family_refresh_label(fam)
+            );
             run_or_bail(&mut upd, "trust update")?;
             tracing::info!("CA installed into the system trust store ✓");
             Ok(())
@@ -396,7 +400,10 @@ fn handle_untrust() -> Result<()> {
             );
             run_or_bail(&mut rm, "CA removal")?;
             let mut upd = linux_family_refresh_command(fam);
-            tracing::info!("rebuilding system trust bundle ({})...", linux_family_refresh_label(fam));
+            tracing::info!(
+                "rebuilding system trust bundle ({})...",
+                linux_family_refresh_label(fam)
+            );
             run_or_bail(&mut upd, "trust update")?;
             tracing::info!("CA removed from the system trust store ✓");
             Ok(())
@@ -577,7 +584,13 @@ fn linux_family_from_os_release(body: &str) -> Option<LinuxFamily> {
     // family). If that ever changes, the first match wins and we'd
     // need to revisit.
     const REDHAT_IDS: &[&str] = &[
-        "fedora", "rhel", "centos", "rocky", "almalinux", "ol", "oracle",
+        "fedora",
+        "rhel",
+        "centos",
+        "rocky",
+        "almalinux",
+        "ol",
+        "oracle",
     ];
     // Derivatives that ship `ID_LIKE=arch` (Garuda, ArcoLinux, etc.) are
     // caught by the ID_LIKE token sweep above — kept off the explicit
@@ -1346,7 +1359,10 @@ mod tests {
     #[test]
     fn is_debian_family_false_when_sentinel_file_absent() {
         let r = is_debian_family(|_| false);
-        assert!(!r, "should NOT detect Debian family when sentinel is absent");
+        assert!(
+            !r,
+            "should NOT detect Debian family when sentinel is absent"
+        );
     }
 
     #[test]
@@ -1477,7 +1493,10 @@ mod tests {
         // reference, not a derivative. Routing must succeed on the ID
         // alone, without depending on ID_LIKE being present.
         let os_release = fixture_os_release("fedora", None);
-        assert_eq!(linux_family_from_os_release(&os_release), Some(LinuxFamily::RedHat));
+        assert_eq!(
+            linux_family_from_os_release(&os_release),
+            Some(LinuxFamily::RedHat)
+        );
     }
 
     #[test]
@@ -1486,7 +1505,10 @@ mod tests {
         // must pick up RHEL on the ID alone — the ID_LIKE check is
         // about derivatives that DON'T set a known ID.
         let os_release = fixture_os_release("rhel", Some("fedora"));
-        assert_eq!(linux_family_from_os_release(&os_release), Some(LinuxFamily::RedHat));
+        assert_eq!(
+            linux_family_from_os_release(&os_release),
+            Some(LinuxFamily::RedHat)
+        );
     }
 
     #[test]
@@ -1495,7 +1517,10 @@ mod tests {
         // The space-separated ID_LIKE is the freedesktop.org spec —
         // parsing must tokenize it, not match the whole string.
         let os_release = fixture_os_release("centos", Some("rhel fedora"));
-        assert_eq!(linux_family_from_os_release(&os_release), Some(LinuxFamily::RedHat));
+        assert_eq!(
+            linux_family_from_os_release(&os_release),
+            Some(LinuxFamily::RedHat)
+        );
     }
 
     #[test]
@@ -1504,7 +1529,10 @@ mod tests {
         // Real-world ID_LIKE values are often quoted AND multi-token —
         // both must round-trip through the parser.
         let os_release = fixture_os_release("rocky", Some("rhel centos fedora"));
-        assert_eq!(linux_family_from_os_release(&os_release), Some(LinuxFamily::RedHat));
+        assert_eq!(
+            linux_family_from_os_release(&os_release),
+            Some(LinuxFamily::RedHat)
+        );
     }
 
     #[test]
@@ -1514,7 +1542,10 @@ mod tests {
         // missed, a chunk of the production-RHEL user base gets no
         // trust automation.
         let os_release = fixture_os_release("almalinux", Some("rhel centos fedora"));
-        assert_eq!(linux_family_from_os_release(&os_release), Some(LinuxFamily::RedHat));
+        assert_eq!(
+            linux_family_from_os_release(&os_release),
+            Some(LinuxFamily::RedHat)
+        );
     }
 
     #[test]
@@ -1523,7 +1554,10 @@ mod tests {
         // the reference, not a derivative. Routing must succeed on ID
         // alone.
         let os_release = fixture_os_release("arch", None);
-        assert_eq!(linux_family_from_os_release(&os_release), Some(LinuxFamily::Arch));
+        assert_eq!(
+            linux_family_from_os_release(&os_release),
+            Some(LinuxFamily::Arch)
+        );
     }
 
     #[test]
@@ -1532,7 +1566,10 @@ mod tests {
         // must accept either an exact-known ID or a known token in
         // ID_LIKE — Manjaro tests both halves of that.
         let os_release = fixture_os_release("manjaro", Some("arch"));
-        assert_eq!(linux_family_from_os_release(&os_release), Some(LinuxFamily::Arch));
+        assert_eq!(
+            linux_family_from_os_release(&os_release),
+            Some(LinuxFamily::Arch)
+        );
     }
 
     #[test]
@@ -1540,7 +1577,10 @@ mod tests {
         // EndeavourOS ships ID=endeavouros with ID_LIKE=arch. Same
         // "ID_LIKE-only matches a known family" pattern as Manjaro.
         let os_release = fixture_os_release("endeavouros", Some("arch"));
-        assert_eq!(linux_family_from_os_release(&os_release), Some(LinuxFamily::Arch));
+        assert_eq!(
+            linux_family_from_os_release(&os_release),
+            Some(LinuxFamily::Arch)
+        );
     }
 
     #[test]
@@ -1574,7 +1614,10 @@ mod tests {
         let rh = linux_family_install_path(LinuxFamily::RedHat);
         let arch = linux_family_install_path(LinuxFamily::Arch);
         assert_eq!(rh, "/etc/pki/ca-trust/source/anchors/aichu-ca.crt");
-        assert_eq!(arch, "/etc/ca-certificates/trust-source/anchors/aichu-ca.crt");
+        assert_eq!(
+            arch,
+            "/etc/ca-certificates/trust-source/anchors/aichu-ca.crt"
+        );
         assert_ne!(rh, arch, "families must route to distinct paths");
     }
 
@@ -1613,7 +1656,11 @@ mod tests {
         // plus the underlying utilities behaving as expected.
         let dir = tempfile::TempDir::new().unwrap();
         let src = dir.path().join("aichu-ca.pem");
-        std::fs::write(&src, b"-----BEGIN CERTIFICATE-----\nfake\n-----END CERTIFICATE-----\n").unwrap();
+        std::fs::write(
+            &src,
+            b"-----BEGIN CERTIFICATE-----\nfake\n-----END CERTIFICATE-----\n",
+        )
+        .unwrap();
 
         // Mirror the RedHat anchors layout under the tempdir.
         let anchors = dir.path().join("etc/pki/ca-trust/source/anchors");
@@ -1622,9 +1669,12 @@ mod tests {
 
         // `install -m 644 <src> <dest>` — no sudo, tempdir is ours.
         let status = Command::new("install")
-            .arg("-m").arg("644")
-            .arg(&src).arg(&dest)
-            .status().expect("install(1) available on POSIX hosts");
+            .arg("-m")
+            .arg("644")
+            .arg(&src)
+            .arg(&dest)
+            .status()
+            .expect("install(1) available on POSIX hosts");
         assert!(status.success(), "install failed: {status:?}");
         assert!(dest.exists(), "cert should be at RedHat anchors path");
 
@@ -1644,16 +1694,23 @@ mod tests {
         // load-bearing.
         let dir = tempfile::TempDir::new().unwrap();
         let src = dir.path().join("aichu-ca.pem");
-        std::fs::write(&src, b"-----BEGIN CERTIFICATE-----\nfake\n-----END CERTIFICATE-----\n").unwrap();
+        std::fs::write(
+            &src,
+            b"-----BEGIN CERTIFICATE-----\nfake\n-----END CERTIFICATE-----\n",
+        )
+        .unwrap();
 
         let anchors = dir.path().join("etc/ca-certificates/trust-source/anchors");
         std::fs::create_dir_all(&anchors).unwrap();
         let dest = anchors.join("aichu-ca.crt");
 
         let status = Command::new("install")
-            .arg("-m").arg("644")
-            .arg(&src).arg(&dest)
-            .status().expect("install(1) available on POSIX hosts");
+            .arg("-m")
+            .arg("644")
+            .arg(&src)
+            .arg(&dest)
+            .status()
+            .expect("install(1) available on POSIX hosts");
         assert!(status.success(), "install failed: {status:?}");
         assert!(dest.exists(), "cert should be at Arch anchors path");
 
@@ -1671,10 +1728,7 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         std::fs::write(dir.path().join(proxy_mitm::ca::CERT_FILENAME), "fake-cert").unwrap();
         std::fs::write(dir.path().join(proxy_mitm::ca::KEY_FILENAME), "fake-key").unwrap();
-        assert!(matches!(
-            check_ca_present(dir.path()),
-            CheckResult::Ok(_)
-        ));
+        assert!(matches!(check_ca_present(dir.path()), CheckResult::Ok(_)));
     }
 
     #[test]
@@ -1683,7 +1737,10 @@ mod tests {
         let result = check_ca_present(dir.path());
         match result {
             CheckResult::Fail { hint, .. } => {
-                assert!(hint.contains("aichu run"), "hint should point at `aichu run`: {hint}");
+                assert!(
+                    hint.contains("aichu run"),
+                    "hint should point at `aichu run`: {hint}"
+                );
             }
             other => panic!("expected Fail, got {other:?}"),
         }
@@ -1960,9 +2017,7 @@ mod tests {
                     "absent-CA message should describe the install gap: {message}"
                 );
             }
-            other => panic!(
-                "absent CA must be Fail (mirroring `aichu trust` exit), got {other:?}"
-            ),
+            other => panic!("absent CA must be Fail (mirroring `aichu trust` exit), got {other:?}"),
         }
     }
 

@@ -110,8 +110,7 @@ impl Model for OpenAiProvider {
             anyhow::bail!("openai {status}: {body}");
         }
 
-        let parsed: ChatCompletionsResponse =
-            resp.json().await.context("parse openai response")?;
+        let parsed: ChatCompletionsResponse = resp.json().await.context("parse openai response")?;
         let text = parsed
             .choices
             .into_iter()

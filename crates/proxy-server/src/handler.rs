@@ -32,11 +32,11 @@
 use std::sync::Arc;
 
 use axum::{
-    Router,
     body::Body,
     extract::{Request, State},
     http::{HeaderMap, Response, StatusCode},
     routing::post,
+    Router,
 };
 use bytes::Bytes;
 use futures_util::stream::{self, Stream, StreamExt};
@@ -53,9 +53,7 @@ struct AppState {
 
 pub fn router(config: RelayConfig) -> Router {
     let state = AppState {
-        http: Client::builder()
-            .build()
-            .expect("build reqwest client"),
+        http: Client::builder().build().expect("build reqwest client"),
         config: Arc::new(config),
     };
     Router::new()
@@ -70,10 +68,7 @@ pub fn router(config: RelayConfig) -> Router {
         .with_state(state)
 }
 
-async fn handle_anthropic_messages(
-    State(state): State<AppState>,
-    req: Request,
-) -> Response<Body> {
+async fn handle_anthropic_messages(State(state): State<AppState>, req: Request) -> Response<Body> {
     let url = format!("{}/v1/messages", state.config.anthropic_upstream);
     let inject = state
         .config
@@ -82,10 +77,7 @@ async fn handle_anthropic_messages(
     forward(state.http, url, req, inject).await
 }
 
-async fn handle_openai_chat(
-    State(state): State<AppState>,
-    req: Request,
-) -> Response<Body> {
+async fn handle_openai_chat(State(state): State<AppState>, req: Request) -> Response<Body> {
     let url = format!("{}/v1/chat/completions", state.config.openai_upstream);
     let inject = state
         .config
@@ -94,10 +86,7 @@ async fn handle_openai_chat(
     forward(state.http, url, req, inject).await
 }
 
-async fn handle_openai_responses(
-    State(state): State<AppState>,
-    req: Request,
-) -> Response<Body> {
+async fn handle_openai_responses(State(state): State<AppState>, req: Request) -> Response<Body> {
     let url = format!("{}/v1/responses", state.config.openai_upstream);
     let inject = state
         .config
@@ -136,10 +125,7 @@ async fn forward(
     let body_bytes = match axum::body::to_bytes(body, usize::MAX).await {
         Ok(b) => b,
         Err(e) => {
-            return error_response(
-                StatusCode::BAD_REQUEST,
-                format!("read inbound body: {e}"),
-            );
+            return error_response(StatusCode::BAD_REQUEST, format!("read inbound body: {e}"));
         }
     };
 
@@ -256,17 +242,12 @@ async fn forward(
                         Body::from(Bytes::from(restored))
                     }
                     Err(_) => {
-                        tracing::debug!(
-                            "non-utf8 response from {url}, returning unchanged",
-                        );
+                        tracing::debug!("non-utf8 response from {url}, returning unchanged",);
                         Body::from(bytes)
                     }
                 },
                 Err(e) => {
-                    return error_response(
-                        StatusCode::BAD_GATEWAY,
-                        format!("upstream body: {e}"),
-                    );
+                    return error_response(StatusCode::BAD_GATEWAY, format!("upstream body: {e}"));
                 }
             }
         }

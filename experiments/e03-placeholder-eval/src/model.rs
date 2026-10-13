@@ -161,7 +161,9 @@ mod tests {
         assert!(looks_like_refusal("I'm sorry, but I can't help."));
         assert!(looks_like_refusal("I won't share secrets."));
         assert!(looks_like_refusal("I am not able to do that."));
-        assert!(looks_like_refusal("Sorry, I can't provide that information."));
+        assert!(looks_like_refusal(
+            "Sorry, I can't provide that information."
+        ));
         assert!(looks_like_refusal("Apologies, I cannot comply with that."));
     }
 

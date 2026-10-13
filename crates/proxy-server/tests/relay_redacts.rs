@@ -9,22 +9,17 @@
 //! (especially streaming SSE) is Phase 2.
 
 use std::net::SocketAddr;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
-use axum::{
-    Json, Router,
-    body::Bytes,
-    extract::State,
-    routing::post,
-};
-use serde_json::{Value, json};
+use axum::{body::Bytes, extract::State, routing::post, Json, Router};
+use serde_json::{json, Value};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::oneshot;
 
-use proxy_server::{RelayConfig, run_relay};
+use proxy_server::{run_relay, RelayConfig};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn relay_redacts_aws_key_before_forwarding() -> Result<()> {
@@ -314,8 +309,7 @@ async fn relay_reverses_placeholder_in_streaming_sse_response() -> Result<()> {
 /// events.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn phase_2c_relay_reverses_placeholder_split_across_sse_events() -> Result<()> {
-    let upstream =
-        spawn_upstream_returning_sse_with_split_placeholder("/v1/messages").await?;
+    let upstream = spawn_upstream_returning_sse_with_split_placeholder("/v1/messages").await?;
 
     let config = RelayConfig {
         anthropic_upstream: format!("http://{}", upstream.addr),
@@ -446,7 +440,9 @@ async fn relay_injects_preserve_tokens_system_prompt_into_openai_chat_request() 
     assert_eq!(messages[0]["role"], "system");
     assert_eq!(messages[0]["content"], proxy_core::PRESERVE_TOKENS_PROMPT);
     assert_eq!(messages[1]["role"], "user");
-    let user_content = messages[1]["content"].as_str().expect("user content is string");
+    let user_content = messages[1]["content"]
+        .as_str()
+        .expect("user content is string");
     assert!(user_content.contains("\u{ab}SECRET_AWS_KEY_001\u{bb}"));
     assert!(!user_content.contains("AKIAIOSFODNN7EXAMPLE"));
 
@@ -492,7 +488,9 @@ async fn relay_injects_preserve_tokens_system_prompt_into_responses_request() ->
     let parsed: Value = serde_json::from_str(std::str::from_utf8(&captured)?)?;
 
     // Top-level `instructions` carries our prompt as a string.
-    let instructions = parsed["instructions"].as_str().expect("instructions is string");
+    let instructions = parsed["instructions"]
+        .as_str()
+        .expect("instructions is string");
     assert!(
         instructions.starts_with(proxy_core::PRESERVE_TOKENS_PROMPT),
         "preserve-tokens prompt must be at the front of `instructions`; got: {instructions}",
@@ -691,10 +689,7 @@ async fn spawn_upstream_returning_sse_with_split_placeholder(
 /// Spin up an axum SSE upstream that emits `events` as
 /// `content_block_delta` events. Captures the request body for
 /// caller assertions.
-async fn spawn_sse_upstream(
-    path: &'static str,
-    events: Vec<String>,
-) -> Result<CapturingUpstream> {
+async fn spawn_sse_upstream(path: &'static str, events: Vec<String>) -> Result<CapturingUpstream> {
     use axum::response::sse::{Event as SseEvent, Sse};
     use futures_util::stream;
     use std::convert::Infallible;
@@ -716,18 +711,14 @@ async fn spawn_sse_upstream(
 
     let handler = move |State(state): State<SseState>,
                         body: Bytes|
-          -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Sse<_>> + Send>,
-    > {
+          -> std::pin::Pin<Box<dyn std::future::Future<Output = Sse<_>> + Send>> {
         state.request_count.fetch_add(1, Ordering::Relaxed);
         *state.last_body.lock().unwrap() = Some(body);
 
         let events: Vec<Result<SseEvent, Infallible>> = state
             .events
             .iter()
-            .map(|data| {
-                Ok(SseEvent::default().event("content_block_delta").data(data))
-            })
+            .map(|data| Ok(SseEvent::default().event("content_block_delta").data(data)))
             .collect();
         Box::pin(async move { Sse::new(stream::iter(events)) })
     };

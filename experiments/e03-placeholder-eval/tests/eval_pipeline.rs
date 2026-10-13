@@ -17,24 +17,20 @@
 //!      / `usage.completion_tokens`) — without any API budget burn.
 
 use std::net::SocketAddr;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
-use axum::{
-    Json, Router,
-    extract::State,
-    http::HeaderMap,
-    routing::post,
-};
-use serde_json::{Value, json};
+use axum::{extract::State, http::HeaderMap, routing::post, Json, Router};
+use serde_json::{json, Value};
 use tokio::net::{TcpListener, TcpStream};
 
 use e03_placeholder_eval::{
-    PlaceholderFormat, evaluate,
+    evaluate,
     model::{EchoModel, StaticModel},
     providers::{anthropic::AnthropicProvider, openai::OpenAiProvider},
+    PlaceholderFormat,
 };
 
 #[tokio::test]
@@ -91,7 +87,10 @@ async fn static_model_response_without_placeholder_yields_not_preserved() -> Res
         None,
     )
     .await?;
-    assert!(!r.preserved, "static model response without placeholder should be preserved=false");
+    assert!(
+        !r.preserved,
+        "static model response without placeholder should be preserved=false"
+    );
     assert!(!r.refused, "static reply does not look like a refusal");
     Ok(())
 }
@@ -346,7 +345,11 @@ async fn anthropic_provider_passes_system_field_top_level() -> Result<()> {
     let messages = saw.body["messages"]
         .as_array()
         .expect("messages must be an array");
-    assert_eq!(messages.len(), 1, "anthropic messages array carries user only");
+    assert_eq!(
+        messages.len(),
+        1,
+        "anthropic messages array carries user only"
+    );
     assert_eq!(messages[0]["role"], "user");
     Ok(())
 }
@@ -365,7 +368,7 @@ async fn incremental_write_persists_after_each_call() -> Result<()> {
     // that many records. If a future refactor reverts to
     // write-once-at-end, this test fails before any real run loses
     // budget.
-    use e03_placeholder_eval::{Fixture, run_loop};
+    use e03_placeholder_eval::{run_loop, Fixture};
     use std::fs;
 
     // Three fixtures × one format = three cells, so we can observe
@@ -459,7 +462,11 @@ async fn incremental_write_persists_after_each_call() -> Result<()> {
     let formats = [PlaceholderFormat::Guillemets];
     let results = run_loop(&fixtures, &formats, &model, None, &out_path).await?;
 
-    assert_eq!(results.len(), 3, "three cells should have produced three results");
+    assert_eq!(
+        results.len(),
+        3,
+        "three cells should have produced three results"
+    );
 
     // Observed counts before each call: 0, 1, 2 — proves the write
     // happens AFTER each complete(), not just at the end.
@@ -475,8 +482,8 @@ async fn incremental_write_persists_after_each_call() -> Result<()> {
     // exactly 3 records. (run_loop's contract — the same contract a
     // killed run relies on for its partial output.)
     let final_text = fs::read_to_string(&out_path)?;
-    let v: serde_json::Value = serde_json::from_str(&final_text)
-        .expect("final on-disk file must be valid JSON");
+    let v: serde_json::Value =
+        serde_json::from_str(&final_text).expect("final on-disk file must be valid JSON");
     let arr = v.as_array().expect("must be a JSON array");
     assert_eq!(arr.len(), 3, "final file has 3 records");
     // Records are full EvalResult shapes (sanity check on one field).

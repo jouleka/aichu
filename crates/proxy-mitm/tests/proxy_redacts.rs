@@ -13,18 +13,13 @@
 //! `experiments/e01-hudsucker-mitm/README.md`.
 
 use std::net::SocketAddr;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
-use axum::{
-    Json, Router,
-    body::Bytes,
-    extract::State,
-    routing::post,
-};
-use serde_json::{Value, json};
+use axum::{body::Bytes, extract::State, routing::post, Json, Router};
+use serde_json::{json, Value};
 use tempfile::TempDir;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::oneshot;
@@ -429,8 +424,12 @@ async fn mitm_isolates_concurrent_h2_streams_on_one_connection() -> Result<()> {
         let (resp_a_fut, mut send_a) = h2_client.send_request(req_a, false).unwrap();
         let (resp_b_fut, mut send_b) = h2_client.send_request(req_b, false).unwrap();
 
-        send_a.send_data(H2Bytes::from(body_a.clone()), true).unwrap();
-        send_b.send_data(H2Bytes::from(body_b.clone()), true).unwrap();
+        send_a
+            .send_data(H2Bytes::from(body_a.clone()), true)
+            .unwrap();
+        send_b
+            .send_data(H2Bytes::from(body_b.clone()), true)
+            .unwrap();
 
         // Drop the SendRequest handle so the connection knows no
         // further requests are coming. Otherwise h2 keeps the
@@ -450,20 +449,16 @@ async fn mitm_isolates_concurrent_h2_streams_on_one_connection() -> Result<()> {
         Ok::<(String, String), anyhow::Error>((body_a_local, body_b_local))
     };
 
-    let (body_a_recv, body_b_recv) = match tokio::time::timeout(
-        Duration::from_secs(15),
-        round_trip,
-    )
-    .await
-    {
-        Ok(Ok(t)) => t,
-        Ok(Err(e)) => return Err(e),
-        Err(_) => anyhow::bail!(
-            "H2 round-trip timed out — likely a regression in proxy H2 \
+    let (body_a_recv, body_b_recv) =
+        match tokio::time::timeout(Duration::from_secs(15), round_trip).await {
+            Ok(Ok(t)) => t,
+            Ok(Err(e)) => return Err(e),
+            Err(_) => anyhow::bail!(
+                "H2 round-trip timed out — likely a regression in proxy H2 \
              handling or stream lifecycle. The race-condition assertions \
              below cannot run without both responses."
-        ),
-    };
+            ),
+        };
 
     // Headline contract: each response must contain its OWN secret.
     // The upstream echoes the (redacted) request body back in its
@@ -558,7 +553,9 @@ async fn mitm_injects_preserve_tokens_system_prompt_into_anthropic_request() -> 
     // would be detected and stripped — the assertion below would
     // hold but `placeholders = 1` in the log would not. The pair
     // pins the ordering: redact, THEN inject.
-    let system_text = parsed["system"].as_str().expect("system should be a string");
+    let system_text = parsed["system"]
+        .as_str()
+        .expect("system should be a string");
     assert!(
         system_text.starts_with(proxy_core::PRESERVE_TOKENS_PROMPT),
         "injected prompt must be the FIRST content in `system`; got: {system_text}"
@@ -626,7 +623,9 @@ async fn mitm_injects_preserve_tokens_system_prompt_into_openai_chat_request() -
     // Index 1: the redacted user message. Both that the original
     // message survived AND that redaction happened before injection.
     assert_eq!(messages[1]["role"], "user");
-    let user_content = messages[1]["content"].as_str().expect("user content is a string");
+    let user_content = messages[1]["content"]
+        .as_str()
+        .expect("user content is a string");
     assert!(
         user_content.contains("\u{ab}SECRET_AWS_KEY_001\u{bb}"),
         "user content must carry the redaction placeholder: {user_content}"
@@ -790,8 +789,7 @@ async fn mitm_isolates_concurrent_h2_streams_under_https_connect_tunnel() -> Res
     // server-side parsing on the proxy is happier with a DNS SAN.
     const TUNNEL_HOST: &str = "localhost";
 
-    let (upstream_addr, upstream_cert_pem) =
-        spawn_h2_tls_echoing_upstream(TUNNEL_HOST).await?;
+    let (upstream_addr, upstream_cert_pem) = spawn_h2_tls_echoing_upstream(TUNNEL_HOST).await?;
 
     let ca_dir = TempDir::new()?;
     let ca = load_or_create_ca(ca_dir.path())?;
@@ -881,8 +879,7 @@ async fn mitm_isolates_concurrent_h2_streams_under_https_connect_tunnel() -> Res
             }
         }
         let response_head = std::str::from_utf8(&header_buf)?;
-        if !response_head.starts_with("HTTP/1.1 200")
-            && !response_head.starts_with("HTTP/1.0 200")
+        if !response_head.starts_with("HTTP/1.1 200") && !response_head.starts_with("HTTP/1.0 200")
         {
             anyhow::bail!("proxy refused CONNECT: {response_head}");
         }
@@ -942,13 +939,25 @@ async fn mitm_isolates_concurrent_h2_streams_under_https_connect_tunnel() -> Res
         // a shared `current_map`.
         let (resp_a_fut, mut send_a) = h2_client.send_request(req_a, false).unwrap();
         let (resp_b_fut, mut send_b) = h2_client.send_request(req_b, false).unwrap();
-        send_a.send_data(H2Bytes::from(body_a.clone()), true).unwrap();
-        send_b.send_data(H2Bytes::from(body_b.clone()), true).unwrap();
+        send_a
+            .send_data(H2Bytes::from(body_a.clone()), true)
+            .unwrap();
+        send_b
+            .send_data(H2Bytes::from(body_b.clone()), true)
+            .unwrap();
         drop(h2_client);
 
         let (resp_a, resp_b) = tokio::try_join!(resp_a_fut, resp_b_fut)?;
-        assert_eq!(resp_a.status(), 200, "response A should be 200 over CONNECT+H2");
-        assert_eq!(resp_b.status(), 200, "response B should be 200 over CONNECT+H2");
+        assert_eq!(
+            resp_a.status(),
+            200,
+            "response A should be 200 over CONNECT+H2"
+        );
+        assert_eq!(
+            resp_b.status(),
+            200,
+            "response B should be 200 over CONNECT+H2"
+        );
 
         let body_a_local = collect_h2_body(resp_a.into_body()).await?;
         let body_b_local = collect_h2_body(resp_b.into_body()).await?;
@@ -957,21 +966,17 @@ async fn mitm_isolates_concurrent_h2_streams_under_https_connect_tunnel() -> Res
         Ok::<(String, String), anyhow::Error>((body_a_local, body_b_local))
     };
 
-    let (body_a_recv, body_b_recv) = match tokio::time::timeout(
-        Duration::from_secs(20),
-        round_trip,
-    )
-    .await
-    {
-        Ok(Ok(t)) => t,
-        Ok(Err(e)) => return Err(e),
-        Err(_) => anyhow::bail!(
-            "CONNECT+TLS+H2 round-trip timed out — likely a regression \
+    let (body_a_recv, body_b_recv) =
+        match tokio::time::timeout(Duration::from_secs(20), round_trip).await {
+            Ok(Ok(t)) => t,
+            Ok(Err(e)) => return Err(e),
+            Err(_) => anyhow::bail!(
+                "CONNECT+TLS+H2 round-trip timed out — likely a regression \
              in the per-clone `current_map` invariant on hudsucker's \
              inner `service_fn` path. The race-condition assertions \
              below cannot run without both responses."
-        ),
-    };
+            ),
+        };
 
     // Same headline contract as the plain-H2 sibling test: each
     // response carries its OWN secret, neither carries the other's,
@@ -1099,8 +1104,8 @@ async fn collect_h2_body(mut body: h2::RecvStream) -> Result<String> {
 /// honest about what it exercises.
 async fn spawn_h2_tls_echoing_upstream(sni_name: &'static str) -> Result<(SocketAddr, Vec<u8>)> {
     use hudsucker::rcgen::generate_simple_self_signed;
-    use tokio_rustls::TlsAcceptor;
     use tokio_rustls::rustls::ServerConfig;
+    use tokio_rustls::TlsAcceptor;
 
     // Idempotent — proxy_mitm::run_proxy installs this too, but the
     // test's rustls server might come up before the proxy does.
@@ -1216,7 +1221,9 @@ async fn spawn_echoing_upstream(path: &'static str) -> Result<CapturingUpstream>
     let request_count = state.request_count.clone();
     let last_body = state.last_body.clone();
 
-    let app = Router::new().route(path, post(echo_handler)).with_state(state);
+    let app = Router::new()
+        .route(path, post(echo_handler))
+        .with_state(state);
 
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
@@ -1265,10 +1272,7 @@ async fn spawn_upstream_returning_sse_with_split_placeholder(
     .await
 }
 
-async fn spawn_sse_upstream(
-    path: &'static str,
-    events: Vec<String>,
-) -> Result<CapturingUpstream> {
+async fn spawn_sse_upstream(path: &'static str, events: Vec<String>) -> Result<CapturingUpstream> {
     use axum::response::sse::{Event as SseEvent, Sse};
     use futures_util::stream;
     use std::convert::Infallible;
@@ -1290,18 +1294,14 @@ async fn spawn_sse_upstream(
 
     let handler = move |State(state): State<SseState>,
                         body: Bytes|
-          -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Sse<_>> + Send>,
-    > {
+          -> std::pin::Pin<Box<dyn std::future::Future<Output = Sse<_>> + Send>> {
         state.request_count.fetch_add(1, Ordering::Relaxed);
         *state.last_body.lock().unwrap() = Some(body);
 
         let events: Vec<Result<SseEvent, Infallible>> = state
             .events
             .iter()
-            .map(|data| {
-                Ok(SseEvent::default().event("content_block_delta").data(data))
-            })
+            .map(|data| Ok(SseEvent::default().event("content_block_delta").data(data)))
             .collect();
         Box::pin(async move { Sse::new(stream::iter(events)) })
     };
@@ -1450,9 +1450,9 @@ async fn spawn_proxy_trusting_upstream(
     handler: AichuHandler,
     extra_root_pem: &[u8],
 ) -> Result<(SocketAddr, oneshot::Sender<()>)> {
-    use hudsucker::Proxy;
-    use hudsucker::rustls::ClientConfig as RustlsClientConfig;
     use hudsucker::rustls::crypto::aws_lc_rs;
+    use hudsucker::rustls::ClientConfig as RustlsClientConfig;
+    use hudsucker::Proxy;
 
     // Same idempotent install as `run_proxy` does — required before
     // any rustls ClientConfig construction on rustls 0.23.
@@ -1473,13 +1473,12 @@ async fn spawn_proxy_trusting_upstream(
             .map_err(|e| anyhow::anyhow!("add extra root to store: {e}"))?;
     }
 
-    let rustls_config = RustlsClientConfig::builder_with_provider(Arc::new(
-        aws_lc_rs::default_provider(),
-    ))
-    .with_safe_default_protocol_versions()
-    .map_err(|e| anyhow::anyhow!("rustls protocol versions: {e}"))?
-    .with_root_certificates(root_store)
-    .with_no_client_auth();
+    let rustls_config =
+        RustlsClientConfig::builder_with_provider(Arc::new(aws_lc_rs::default_provider()))
+            .with_safe_default_protocol_versions()
+            .map_err(|e| anyhow::anyhow!("rustls protocol versions: {e}"))?
+            .with_root_certificates(root_store)
+            .with_no_client_auth();
 
     let https = hyper_rustls::HttpsConnectorBuilder::new()
         .with_tls_config(rustls_config)
