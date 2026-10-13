@@ -17,7 +17,7 @@ use std::future::Future;
 use std::net::SocketAddr;
 
 use anyhow::{Context, Result};
-use hudsucker::{Proxy, certificate_authority::RcgenAuthority, rustls::crypto::aws_lc_rs};
+use hudsucker::{certificate_authority::RcgenAuthority, rustls::crypto::aws_lc_rs, Proxy};
 
 use crate::handler::AichuHandler;
 
@@ -47,7 +47,10 @@ where
         .build()
         .context("build hudsucker proxy")?;
 
-    proxy.start().await.context("hudsucker proxy stopped with error")
+    proxy
+        .start()
+        .await
+        .context("hudsucker proxy stopped with error")
 }
 
 /// Install the aws-lc-rs rustls crypto provider as the process default,

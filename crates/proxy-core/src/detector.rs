@@ -27,7 +27,7 @@ use std::sync::OnceLock;
 use aho_corasick::AhoCorasick;
 use regex::Regex;
 
-use crate::{Finding, rules::SecretKind};
+use crate::{rules::SecretKind, Finding};
 
 struct Compiled {
     prefilter: AhoCorasick,
@@ -198,8 +198,7 @@ fn gcp_service_account_envelopes(input: &str) -> Vec<(usize, usize)> {
     // a quoted mention.
     static MARKER: OnceLock<Regex> = OnceLock::new();
     let marker = MARKER.get_or_init(|| {
-        Regex::new(r#""type"\s*:\s*"service_account""#)
-            .expect("gcp marker regex builds")
+        Regex::new(r#""type"\s*:\s*"service_account""#).expect("gcp marker regex builds")
     });
 
     let marker_starts: Vec<usize> = marker.find_iter(input).map(|m| m.start()).collect();
@@ -406,7 +405,10 @@ mod tests {
         let ghp = format!("ghp_{}", "a".repeat(36));
         let s = format!("aws=AKIAIOSFODNN7EXAMPLE then gh={ghp}");
         let f = scan(&s);
-        assert_eq!(kinds(&f), vec![SecretKind::AwsAccessKey, SecretKind::GithubPat]);
+        assert_eq!(
+            kinds(&f),
+            vec![SecretKind::AwsAccessKey, SecretKind::GithubPat]
+        );
         // Verify byte offsets are correct and in order.
         assert!(f[0].start < f[1].start);
         assert_eq!(&s[f[0].start..f[0].end], "AKIAIOSFODNN7EXAMPLE");
@@ -456,10 +458,7 @@ mod tests {
         // generated random, ~5.0 bits/char.
         let secret = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
         let h = super::shannon_entropy(secret);
-        assert!(
-            h > 4.0,
-            "expected entropy > 4.0 for random base64; got {h}",
-        );
+        assert!(h > 4.0, "expected entropy > 4.0 for random base64; got {h}",);
     }
 
     #[test]
@@ -503,7 +502,10 @@ mod tests {
             .unwrap();
         // The captured text must be just the 40-char secret, not the
         // identifier prefix or trailing newline.
-        assert_eq!(secret_finding.text, "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY");
+        assert_eq!(
+            secret_finding.text,
+            "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+        );
     }
 
     #[test]
@@ -641,7 +643,10 @@ b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABxxxxxxxxxxxxx
 MIIDazCCAlOgAwIBAgIUWAxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 -----END CERTIFICATE-----";
         let f = scan(pem);
-        assert!(f.is_empty(), "CERTIFICATE block must produce no findings: {f:?}");
+        assert!(
+            f.is_empty(),
+            "CERTIFICATE block must produce no findings: {f:?}"
+        );
     }
 
     #[test]
@@ -653,7 +658,10 @@ MIIDazCCAlOgAwIBAgIUWAxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAxxxxxxxxxxxxxxxxxxxx
 -----END PUBLIC KEY-----";
         let f = scan(pem);
-        assert!(f.is_empty(), "PUBLIC KEY block must produce no findings: {f:?}");
+        assert!(
+            f.is_empty(),
+            "PUBLIC KEY block must produce no findings: {f:?}"
+        );
     }
 
     #[test]
@@ -675,7 +683,11 @@ BBBBB
             .iter()
             .filter(|x| x.kind == SecretKind::PemPrivateKey)
             .collect();
-        assert_eq!(pem_findings.len(), 2, "expected two PEM findings, got {f:?}");
+        assert_eq!(
+            pem_findings.len(),
+            2,
+            "expected two PEM findings, got {f:?}"
+        );
         assert!(pem_findings[0].text.contains("AAAAA"));
         assert!(pem_findings[1].text.contains("BBBBB"));
     }
@@ -697,7 +709,10 @@ BBBBB
             vec![SecretKind::GcpServiceAccountJson],
             "expected exactly one GCP finding, got {f:?}",
         );
-        assert_eq!(f[0].text, blob, "the whole JSON envelope should be the secret");
+        assert_eq!(
+            f[0].text, blob,
+            "the whole JSON envelope should be the secret"
+        );
     }
 
     #[test]
@@ -733,7 +748,8 @@ BBBBB
         let s = r#"{"type":"oauth_client","client_id":"abc","client_secret":"xyz"}"#;
         let f = scan(s);
         assert!(
-            !f.iter().any(|x| x.kind == SecretKind::GcpServiceAccountJson),
+            !f.iter()
+                .any(|x| x.kind == SecretKind::GcpServiceAccountJson),
             "non-service-account JSON must not be flagged as GCP: {f:?}",
         );
     }
@@ -825,7 +841,8 @@ BBBBB
         let s = r#"{"type":"service_account","project_id":"oops-no-close-brace"#;
         let f = scan(s);
         assert!(
-            !f.iter().any(|x| x.kind == SecretKind::GcpServiceAccountJson),
+            !f.iter()
+                .any(|x| x.kind == SecretKind::GcpServiceAccountJson),
             "unbalanced JSON must produce no GCP finding; got {f:?}",
         );
     }
@@ -844,7 +861,8 @@ BBBBB
         let s = r#"{"description":"Use \"type\":\"service_account\" as the discriminator","type":"other"}"#;
         let f = scan(s);
         assert!(
-            !f.iter().any(|x| x.kind == SecretKind::GcpServiceAccountJson),
+            !f.iter()
+                .any(|x| x.kind == SecretKind::GcpServiceAccountJson),
             "marker inside string literal must not match; got {f:?}",
         );
     }

@@ -102,8 +102,8 @@ impl SseReverser {
         // then convert to &str — this is a single allocation per
         // chunk, dominated by the actual SSE parsing cost below.
         let drained: Vec<u8> = self.byte_buf.drain(..valid_len).collect();
-        let chunk_str = std::str::from_utf8(&drained)
-            .expect("valid_len bytes are valid UTF-8 by construction");
+        let chunk_str =
+            std::str::from_utf8(&drained).expect("valid_len bytes are valid UTF-8 by construction");
         Bytes::from(self.push(chunk_str, map))
     }
 
@@ -520,7 +520,9 @@ mod tests {
         assert!(is_partial_placeholder_prefix("\u{ab}SECRET_AWS"));
         assert!(is_partial_placeholder_prefix("\u{ab}SECRET_AWS_KEY"));
         assert!(is_partial_placeholder_prefix("\u{ab}SECRET_AWS_KEY_001"));
-        assert!(is_partial_placeholder_prefix("\u{ab}SECRET_ANTHROPIC_KEY_042"));
+        assert!(is_partial_placeholder_prefix(
+            "\u{ab}SECRET_ANTHROPIC_KEY_042"
+        ));
     }
 
     #[test]
@@ -798,7 +800,8 @@ mod tests {
         let map = map_with(SecretKind::AwsAccessKey, "AKIAIOSFODNN7EXAMPLE");
         let mut r = SseReverser::new();
         let delta_event = text_delta_event("prefix \u{ab}SECRET_AWS_");
-        let stop_event = "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n";
+        let stop_event =
+            "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n";
 
         let mut out = String::new();
         out.push_str(&r.push(&delta_event, &map));
@@ -838,7 +841,12 @@ mod tests {
         let out_b = r.push_bytes(part_b, &map);
         let flushed = r.flush_bytes(&map);
 
-        let combined: Vec<u8> = out_a.iter().chain(out_b.iter()).chain(flushed.iter()).copied().collect();
+        let combined: Vec<u8> = out_a
+            .iter()
+            .chain(out_b.iter())
+            .chain(flushed.iter())
+            .copied()
+            .collect();
         let combined_str = std::str::from_utf8(&combined).expect("output must be valid UTF-8");
         assert!(
             combined_str.contains("AKIAIOSFODNN7EXAMPLE"),

@@ -45,18 +45,18 @@
 // shared across every clone — integration tests assert on the total
 // request count across the whole proxy.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use bytes::Bytes;
 use futures_util::stream::{self, Stream, StreamExt};
 use http_body_util::{BodyDataStream, BodyExt};
 use hudsucker::{
-    Body, HttpContext, HttpHandler, RequestOrResponse,
     hyper::{
-        Request, Response,
         header::{ACCEPT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE},
+        Request, Response,
     },
+    Body, HttpContext, HttpHandler, RequestOrResponse,
 };
 use proxy_core::{Finding, InjectionShape, PlaceholderMap, SseReverser};
 
@@ -359,11 +359,7 @@ impl HttpHandler for AichuHandler {
         RequestOrResponse::Request(Request::from_parts(parts, new_body))
     }
 
-    async fn handle_response(
-        &mut self,
-        _ctx: &HttpContext,
-        res: Response<Body>,
-    ) -> Response<Body> {
+    async fn handle_response(&mut self, _ctx: &HttpContext, res: Response<Body>) -> Response<Body> {
         // Owned String so we can use `ct` after `res` is moved via
         // `into_parts()` below. The HeaderValue's lifetime is tied to
         // `res`, so a `&str` borrow would dangle after the move.

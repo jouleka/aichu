@@ -97,9 +97,10 @@ impl Cli {
     /// here means tests can assert the defaulting policy without
     /// re-parsing argv shapes.
     fn command(&self) -> Commands {
-        self.command
-            .clone()
-            .unwrap_or(Commands::Run(RunArgs { no_system_prompt: false, report: false }))
+        self.command.clone().unwrap_or(Commands::Run(RunArgs {
+            no_system_prompt: false,
+            report: false,
+        }))
     }
 }
 
@@ -144,8 +145,7 @@ fn to_exit_code(result: Result<()>) -> ExitCode {
 fn init_tracing() {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
 }
@@ -179,9 +179,7 @@ async fn run(args: RunArgs) -> Result<()> {
         .with_inject_system_prompt(inject_system_prompt)
         .with_report(args.report);
     if !inject_system_prompt {
-        tracing::info!(
-            "preserve-tokens system prompt injection disabled (--no-system-prompt)",
-        );
+        tracing::info!("preserve-tokens system prompt injection disabled (--no-system-prompt)",);
     }
     if args.report {
         tracing::info!(
@@ -235,7 +233,10 @@ fn handle_trust() -> Result<()> {
 /// nuked `~/.aichu/`.
 #[cfg(target_os = "macos")]
 fn handle_untrust() -> Result<()> {
-    let mut cmd = untrust_command(proxy_mitm::ca::COMMON_NAME, Path::new(MACOS_SYSTEM_KEYCHAIN));
+    let mut cmd = untrust_command(
+        proxy_mitm::ca::COMMON_NAME,
+        Path::new(MACOS_SYSTEM_KEYCHAIN),
+    );
     tracing::info!(
         "removing CA \"{}\" — sudo will prompt for your login password",
         proxy_mitm::ca::COMMON_NAME
@@ -349,7 +350,10 @@ fn handle_trust() -> Result<()> {
             );
             run_or_bail(&mut cp, "CA copy")?;
             let mut upd = linux_family_refresh_command(fam);
-            tracing::info!("rebuilding system trust bundle ({})...", linux_family_refresh_label(fam));
+            tracing::info!(
+                "rebuilding system trust bundle ({})...",
+                linux_family_refresh_label(fam)
+            );
             run_or_bail(&mut upd, "trust update")?;
             tracing::info!("CA installed into the system trust store ✓");
             Ok(())
@@ -396,7 +400,10 @@ fn handle_untrust() -> Result<()> {
             );
             run_or_bail(&mut rm, "CA removal")?;
             let mut upd = linux_family_refresh_command(fam);
-            tracing::info!("rebuilding system trust bundle ({})...", linux_family_refresh_label(fam));
+            tracing::info!(
+                "rebuilding system trust bundle ({})...",
+                linux_family_refresh_label(fam)
+            );
             run_or_bail(&mut upd, "trust update")?;
             tracing::info!("CA removed from the system trust store ✓");
             Ok(())
@@ -577,7 +584,13 @@ fn linux_family_from_os_release(body: &str) -> Option<LinuxFamily> {
     // family). If that ever changes, the first match wins and we'd
     // need to revisit.
     const REDHAT_IDS: &[&str] = &[
-        "fedora", "rhel", "centos", "rocky", "almalinux", "ol", "oracle",
+        "fedora",
+        "rhel",
+        "centos",
+        "rocky",
+        "almalinux",
+        "ol",
+        "oracle",
     ];
     // Derivatives that ship `ID_LIKE=arch` (Garuda, ArcoLinux, etc.) are
     // caught by the ID_LIKE token sweep above — kept off the explicit
@@ -821,19 +834,14 @@ fn check_ca_present(ca_dir: &Path) -> CheckResult {
 /// won't route traffic through aichu — the proxy can be running and
 /// trusted, and prompts will still flow unredacted to the model provider.
 ///
-/// We don't try to parse or validate the URL — heuristic guessing about
-/// "right" URLs would mask real misconfigurations behind opinions. A set
-/// value reports Ok with the value displayed; the user reads it and
-/// decides if it points where they meant.
+/// Report only whether a value is present, because proxy URLs can include
+/// credentials. Presence remains checked without parsing or validating the URL.
 fn check_https_proxy<F>(env: F) -> CheckResult
 where
     F: Fn(&str) -> Option<OsString>,
 {
     match env("HTTPS_PROXY").or_else(|| env("https_proxy")) {
-        Some(value) => CheckResult::Ok(format!(
-            "HTTPS_PROXY={}",
-            value.to_string_lossy()
-        )),
+        Some(_) => CheckResult::Ok("HTTPS_PROXY is set".into()),
         None => CheckResult::Warn {
             message: "HTTPS_PROXY is not set in this shell".into(),
             hint: "export HTTPS_PROXY=http://127.0.0.1:8788 (the proxy still works for any process that DOES have it set)".into(),
@@ -1351,7 +1359,10 @@ mod tests {
     #[test]
     fn is_debian_family_false_when_sentinel_file_absent() {
         let r = is_debian_family(|_| false);
-        assert!(!r, "should NOT detect Debian family when sentinel is absent");
+        assert!(
+            !r,
+            "should NOT detect Debian family when sentinel is absent"
+        );
     }
 
     #[test]
@@ -1482,7 +1493,10 @@ mod tests {
         // reference, not a derivative. Routing must succeed on the ID
         // alone, without depending on ID_LIKE being present.
         let os_release = fixture_os_release("fedora", None);
-        assert_eq!(linux_family_from_os_release(&os_release), Some(LinuxFamily::RedHat));
+        assert_eq!(
+            linux_family_from_os_release(&os_release),
+            Some(LinuxFamily::RedHat)
+        );
     }
 
     #[test]
@@ -1491,7 +1505,10 @@ mod tests {
         // must pick up RHEL on the ID alone — the ID_LIKE check is
         // about derivatives that DON'T set a known ID.
         let os_release = fixture_os_release("rhel", Some("fedora"));
-        assert_eq!(linux_family_from_os_release(&os_release), Some(LinuxFamily::RedHat));
+        assert_eq!(
+            linux_family_from_os_release(&os_release),
+            Some(LinuxFamily::RedHat)
+        );
     }
 
     #[test]
@@ -1500,7 +1517,10 @@ mod tests {
         // The space-separated ID_LIKE is the freedesktop.org spec —
         // parsing must tokenize it, not match the whole string.
         let os_release = fixture_os_release("centos", Some("rhel fedora"));
-        assert_eq!(linux_family_from_os_release(&os_release), Some(LinuxFamily::RedHat));
+        assert_eq!(
+            linux_family_from_os_release(&os_release),
+            Some(LinuxFamily::RedHat)
+        );
     }
 
     #[test]
@@ -1509,7 +1529,10 @@ mod tests {
         // Real-world ID_LIKE values are often quoted AND multi-token —
         // both must round-trip through the parser.
         let os_release = fixture_os_release("rocky", Some("rhel centos fedora"));
-        assert_eq!(linux_family_from_os_release(&os_release), Some(LinuxFamily::RedHat));
+        assert_eq!(
+            linux_family_from_os_release(&os_release),
+            Some(LinuxFamily::RedHat)
+        );
     }
 
     #[test]
@@ -1519,7 +1542,10 @@ mod tests {
         // missed, a chunk of the production-RHEL user base gets no
         // trust automation.
         let os_release = fixture_os_release("almalinux", Some("rhel centos fedora"));
-        assert_eq!(linux_family_from_os_release(&os_release), Some(LinuxFamily::RedHat));
+        assert_eq!(
+            linux_family_from_os_release(&os_release),
+            Some(LinuxFamily::RedHat)
+        );
     }
 
     #[test]
@@ -1528,7 +1554,10 @@ mod tests {
         // the reference, not a derivative. Routing must succeed on ID
         // alone.
         let os_release = fixture_os_release("arch", None);
-        assert_eq!(linux_family_from_os_release(&os_release), Some(LinuxFamily::Arch));
+        assert_eq!(
+            linux_family_from_os_release(&os_release),
+            Some(LinuxFamily::Arch)
+        );
     }
 
     #[test]
@@ -1537,7 +1566,10 @@ mod tests {
         // must accept either an exact-known ID or a known token in
         // ID_LIKE — Manjaro tests both halves of that.
         let os_release = fixture_os_release("manjaro", Some("arch"));
-        assert_eq!(linux_family_from_os_release(&os_release), Some(LinuxFamily::Arch));
+        assert_eq!(
+            linux_family_from_os_release(&os_release),
+            Some(LinuxFamily::Arch)
+        );
     }
 
     #[test]
@@ -1545,7 +1577,10 @@ mod tests {
         // EndeavourOS ships ID=endeavouros with ID_LIKE=arch. Same
         // "ID_LIKE-only matches a known family" pattern as Manjaro.
         let os_release = fixture_os_release("endeavouros", Some("arch"));
-        assert_eq!(linux_family_from_os_release(&os_release), Some(LinuxFamily::Arch));
+        assert_eq!(
+            linux_family_from_os_release(&os_release),
+            Some(LinuxFamily::Arch)
+        );
     }
 
     #[test]
@@ -1579,7 +1614,10 @@ mod tests {
         let rh = linux_family_install_path(LinuxFamily::RedHat);
         let arch = linux_family_install_path(LinuxFamily::Arch);
         assert_eq!(rh, "/etc/pki/ca-trust/source/anchors/aichu-ca.crt");
-        assert_eq!(arch, "/etc/ca-certificates/trust-source/anchors/aichu-ca.crt");
+        assert_eq!(
+            arch,
+            "/etc/ca-certificates/trust-source/anchors/aichu-ca.crt"
+        );
         assert_ne!(rh, arch, "families must route to distinct paths");
     }
 
@@ -1618,7 +1656,11 @@ mod tests {
         // plus the underlying utilities behaving as expected.
         let dir = tempfile::TempDir::new().unwrap();
         let src = dir.path().join("aichu-ca.pem");
-        std::fs::write(&src, b"-----BEGIN CERTIFICATE-----\nfake\n-----END CERTIFICATE-----\n").unwrap();
+        std::fs::write(
+            &src,
+            b"-----BEGIN CERTIFICATE-----\nfake\n-----END CERTIFICATE-----\n",
+        )
+        .unwrap();
 
         // Mirror the RedHat anchors layout under the tempdir.
         let anchors = dir.path().join("etc/pki/ca-trust/source/anchors");
@@ -1627,9 +1669,12 @@ mod tests {
 
         // `install -m 644 <src> <dest>` — no sudo, tempdir is ours.
         let status = Command::new("install")
-            .arg("-m").arg("644")
-            .arg(&src).arg(&dest)
-            .status().expect("install(1) available on POSIX hosts");
+            .arg("-m")
+            .arg("644")
+            .arg(&src)
+            .arg(&dest)
+            .status()
+            .expect("install(1) available on POSIX hosts");
         assert!(status.success(), "install failed: {status:?}");
         assert!(dest.exists(), "cert should be at RedHat anchors path");
 
@@ -1649,16 +1694,23 @@ mod tests {
         // load-bearing.
         let dir = tempfile::TempDir::new().unwrap();
         let src = dir.path().join("aichu-ca.pem");
-        std::fs::write(&src, b"-----BEGIN CERTIFICATE-----\nfake\n-----END CERTIFICATE-----\n").unwrap();
+        std::fs::write(
+            &src,
+            b"-----BEGIN CERTIFICATE-----\nfake\n-----END CERTIFICATE-----\n",
+        )
+        .unwrap();
 
         let anchors = dir.path().join("etc/ca-certificates/trust-source/anchors");
         std::fs::create_dir_all(&anchors).unwrap();
         let dest = anchors.join("aichu-ca.crt");
 
         let status = Command::new("install")
-            .arg("-m").arg("644")
-            .arg(&src).arg(&dest)
-            .status().expect("install(1) available on POSIX hosts");
+            .arg("-m")
+            .arg("644")
+            .arg(&src)
+            .arg(&dest)
+            .status()
+            .expect("install(1) available on POSIX hosts");
         assert!(status.success(), "install failed: {status:?}");
         assert!(dest.exists(), "cert should be at Arch anchors path");
 
@@ -1676,10 +1728,7 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         std::fs::write(dir.path().join(proxy_mitm::ca::CERT_FILENAME), "fake-cert").unwrap();
         std::fs::write(dir.path().join(proxy_mitm::ca::KEY_FILENAME), "fake-key").unwrap();
-        assert!(matches!(
-            check_ca_present(dir.path()),
-            CheckResult::Ok(_)
-        ));
+        assert!(matches!(check_ca_present(dir.path()), CheckResult::Ok(_)));
     }
 
     #[test]
@@ -1688,7 +1737,10 @@ mod tests {
         let result = check_ca_present(dir.path());
         match result {
             CheckResult::Fail { hint, .. } => {
-                assert!(hint.contains("aichu run"), "hint should point at `aichu run`: {hint}");
+                assert!(
+                    hint.contains("aichu run"),
+                    "hint should point at `aichu run`: {hint}"
+                );
             }
             other => panic!("expected Fail, got {other:?}"),
         }
@@ -1710,24 +1762,74 @@ mod tests {
 
     #[test]
     fn check_https_proxy_ok_when_uppercase_var_set() {
-        let r = check_https_proxy(|k| match k {
-            "HTTPS_PROXY" => Some("http://127.0.0.1:8788".into()),
-            _ => None,
+        let lookups = std::cell::RefCell::new(Vec::new());
+        let r = check_https_proxy(|k| {
+            lookups.borrow_mut().push(k.to_string());
+            match k {
+                "HTTPS_PROXY" => {
+                    Some("http://example-user:example-password@proxy.invalid:8080".into())
+                }
+                "https_proxy" => panic!("uppercase setting must take precedence"),
+                _ => None,
+            }
         });
-        assert!(matches!(r, CheckResult::Ok(_)));
+        assert_eq!(lookups.into_inner(), vec!["HTTPS_PROXY"]);
+        assert_eq!(r, CheckResult::Ok("HTTPS_PROXY is set".into()));
+        let rendered = format!("{r:?}");
+        assert!(!rendered.contains("example-user"));
+        assert!(!rendered.contains("example-password"));
+        assert!(!rendered.contains("proxy.invalid"));
     }
 
     #[test]
     fn check_https_proxy_falls_back_to_lowercase_var() {
-        // Many shell environments only set `https_proxy` (lowercase, the
-        // libcurl convention). Coding agents that use libcurl-derived
-        // HTTP clients will read it; doctor must too, or it'd warn about
-        // a setup that actually works.
+        let lookups = std::cell::RefCell::new(Vec::new());
+        let r = check_https_proxy(|k| {
+            lookups.borrow_mut().push(k.to_string());
+            match k {
+                "https_proxy" => {
+                    Some("http://example-user:example-password@proxy.invalid:8080".into())
+                }
+                _ => None,
+            }
+        });
+        assert_eq!(lookups.into_inner(), vec!["HTTPS_PROXY", "https_proxy"]);
+        assert_eq!(r, CheckResult::Ok("HTTPS_PROXY is set".into()));
+        let rendered = format!("{r:?}");
+        assert!(!rendered.contains("example-user"));
+        assert!(!rendered.contains("example-password"));
+        assert!(!rendered.contains("proxy.invalid"));
+    }
+
+    #[test]
+    fn check_https_proxy_accepts_empty_and_malformed_values_without_disclosing_them() {
+        for value in ["", "example-password in a malformed proxy setting"] {
+            let r = check_https_proxy(|k| match k {
+                "HTTPS_PROXY" => Some(value.into()),
+                _ => None,
+            });
+            assert_eq!(r, CheckResult::Ok("HTTPS_PROXY is set".into()));
+            assert!(!format!("{r:?}").contains("example-password"));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn check_https_proxy_does_not_disclose_non_unicode_values() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let mut bytes = b"http://example-user:example-password@proxy.invalid:8080".to_vec();
+        bytes.push(0xff);
+        let value = OsString::from_vec(bytes);
         let r = check_https_proxy(|k| match k {
-            "https_proxy" => Some("http://127.0.0.1:8788".into()),
+            "HTTPS_PROXY" => Some(value.clone()),
             _ => None,
         });
-        assert!(matches!(r, CheckResult::Ok(_)));
+        assert_eq!(r, CheckResult::Ok("HTTPS_PROXY is set".into()));
+        let rendered = format!("{r:?}");
+        assert!(!rendered.contains("example-user"));
+        assert!(!rendered.contains("example-password"));
+        assert!(!rendered.contains("proxy.invalid"));
     }
 
     #[test]
@@ -1915,9 +2017,7 @@ mod tests {
                     "absent-CA message should describe the install gap: {message}"
                 );
             }
-            other => panic!(
-                "absent CA must be Fail (mirroring `aichu trust` exit), got {other:?}"
-            ),
+            other => panic!("absent CA must be Fail (mirroring `aichu trust` exit), got {other:?}"),
         }
     }
 

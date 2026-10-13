@@ -71,7 +71,7 @@
 //     at warn level and leave the body unchanged — never silently
 //     replace a value with a different shape.
 
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
 /// The preserve-tokens system prompt the proxy injects into
 /// forwarded requests. Inline const (no file I/O) — bakes into the
@@ -118,7 +118,10 @@ pub fn inject_anthropic(body: &mut Value) {
 
     match obj.get_mut("system") {
         None => {
-            obj.insert("system".to_string(), Value::String(PRESERVE_TOKENS_PROMPT.to_string()));
+            obj.insert(
+                "system".to_string(),
+                Value::String(PRESERVE_TOKENS_PROMPT.to_string()),
+            );
         }
         Some(Value::String(existing)) => {
             let combined = format!("{PRESERVE_TOKENS_PROMPT}{SEPARATOR}{existing}");
@@ -405,7 +408,10 @@ mod tests {
         assert_eq!(arr.len(), 2, "expected one inserted block + original block");
         assert_eq!(arr[0]["type"], "text");
         assert_eq!(arr[0]["text"], PRESERVE_TOKENS_PROMPT);
-        assert_eq!(arr[1], cached_block, "original cache_control block must survive unchanged");
+        assert_eq!(
+            arr[1], cached_block,
+            "original cache_control block must survive unchanged"
+        );
     }
 
     #[test]
@@ -422,7 +428,10 @@ mod tests {
         });
         let original = body.clone();
         inject_anthropic(&mut body);
-        assert_eq!(body, original, "unexpected system shape must be left untouched");
+        assert_eq!(
+            body, original,
+            "unexpected system shape must be left untouched"
+        );
     }
 
     // ---- inject_openai -----------------------------------------------------
@@ -618,7 +627,10 @@ mod tests {
         });
         let original = body.clone();
         inject_responses(&mut body);
-        assert_eq!(body, original, "unexpected instructions shape must be left untouched");
+        assert_eq!(
+            body, original,
+            "unexpected instructions shape must be left untouched"
+        );
     }
 
     #[test]
@@ -647,7 +659,10 @@ mod tests {
             body["input"], input_array,
             "input array must survive injection byte-for-byte",
         );
-        assert_eq!(body["instructions"].as_str().unwrap(), PRESERVE_TOKENS_PROMPT);
+        assert_eq!(
+            body["instructions"].as_str().unwrap(),
+            PRESERVE_TOKENS_PROMPT
+        );
     }
 
     // ---- InjectionShape::inject dispatch ---------------------------------

@@ -126,7 +126,9 @@ struct MessagesResponse {
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum ContentBlock {
-    Text { text: String },
+    Text {
+        text: String,
+    },
     #[serde(other)]
     Other,
 }

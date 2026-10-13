@@ -33,7 +33,7 @@ use std::process::ExitCode;
 
 use anyhow::{Context, Result};
 use clap::Args;
-use proxy_core::{PlaceholderMap, SecretKind, scan};
+use proxy_core::{scan, PlaceholderMap, SecretKind};
 
 /// Process exit code when `aichu scan` finds at least one secret.
 ///
@@ -145,7 +145,13 @@ fn build_scan_report(input: &str) -> ScanReport {
         let placeholder = map.placeholder_for(f.kind, &f.text);
         let (line, col) = line_col(input, f.start);
         let len = f.text.chars().count();
-        lines.push(format_finding(&f.kind.to_string(), line, col, len, &placeholder));
+        lines.push(format_finding(
+            &f.kind.to_string(),
+            line,
+            col,
+            len,
+            &placeholder,
+        ));
         kinds.insert(f.kind);
     }
     ScanReport {
@@ -336,8 +342,14 @@ mod tests {
         let joined = report.lines.join("\n");
         assert!(joined.contains("AWS_KEY"), "{joined}");
         assert!(joined.contains("GITHUB_PAT"), "{joined}");
-        assert!(joined.contains("\u{ab}SECRET_AWS_KEY_001\u{bb}"), "{joined}");
-        assert!(joined.contains("\u{ab}SECRET_GITHUB_PAT_001\u{bb}"), "{joined}");
+        assert!(
+            joined.contains("\u{ab}SECRET_AWS_KEY_001\u{bb}"),
+            "{joined}"
+        );
+        assert!(
+            joined.contains("\u{ab}SECRET_GITHUB_PAT_001\u{bb}"),
+            "{joined}"
+        );
     }
 
     // ---- read_scan_input --------------------------------------------------

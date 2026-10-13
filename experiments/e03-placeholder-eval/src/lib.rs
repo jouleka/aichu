@@ -11,7 +11,7 @@ pub mod model;
 pub mod placeholder;
 pub mod providers;
 
-pub use fixtures::{Fixture, load_fixtures, parse_fixture};
+pub use fixtures::{load_fixtures, parse_fixture, Fixture};
 
 use std::fs;
 use std::path::Path;
@@ -160,8 +160,7 @@ pub async fn run_loop(
             // far, so partial reads on the next run are trivially
             // recoverable.
             let json = serde_json::to_string_pretty(&results)?;
-            fs::write(out_path, json)
-                .with_context(|| format!("write {}", out_path.display()))?;
+            fs::write(out_path, json).with_context(|| format!("write {}", out_path.display()))?;
         }
     }
     Ok(results)

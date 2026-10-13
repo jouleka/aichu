@@ -131,9 +131,7 @@ impl SecretKind {
             // uppercase .env). The regex itself uses `(?i)` so a
             // freak mixed-case variant `Aws_Secret_...` would also
             // match if it tripped the prefilter.
-            SecretKind::AwsSecretAccessKey => {
-                &["aws_secret_access_key", "AWS_SECRET_ACCESS_KEY"]
-            }
+            SecretKind::AwsSecretAccessKey => &["aws_secret_access_key", "AWS_SECRET_ACCESS_KEY"],
             // PEM blocks always start with this exact 11-byte sequence;
             // the regex then narrows to PRIVATE KEY labels only.
             SecretKind::PemPrivateKey => &["-----BEGIN"],
@@ -160,9 +158,7 @@ impl SecretKind {
             // `(?i)`-wrapped so a mixed-case `Twilio_Auth_Token`
             // identifier still matches if the prefilter trips on one
             // of the cased forms.
-            SecretKind::TwilioAuthToken => {
-                &["SK", "twilio_auth_token", "TWILIO_AUTH_TOKEN"]
-            }
+            SecretKind::TwilioAuthToken => &["SK", "twilio_auth_token", "TWILIO_AUTH_TOKEN"],
             // Cloudflare tokens have no provider-side prefix; we trip
             // the prefilter on the env-var identifiers users commonly
             // assign them to (lowercase Python / uppercase .env both).
@@ -202,9 +198,7 @@ impl SecretKind {
             // JWT: three base64url segments separated by dots. Each
             // header/payload segment starts with `eyJ`. Minimum
             // lengths filter accidental three-dot sequences.
-            SecretKind::Jwt => {
-                r"eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{20,}"
-            }
+            SecretKind::Jwt => r"eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{20,}",
             // Slack: `xox[abpr]-` followed by team/user/secret segments
             // separated by dashes. Real tokens have digit-only ID
             // segments and a fixed length; the build-plan §3 spec is
@@ -487,9 +481,11 @@ mod tests {
                 &[
                     // Minimal valid-shaped blocks for each labeled variant
                     // we want the regex to handle.
-                    "-----BEGIN RSA PRIVATE KEY-----\nMIIE\n-----END RSA PRIVATE KEY-----".to_string(),
+                    "-----BEGIN RSA PRIVATE KEY-----\nMIIE\n-----END RSA PRIVATE KEY-----"
+                        .to_string(),
                     "-----BEGIN PRIVATE KEY-----\nMIIE\n-----END PRIVATE KEY-----".to_string(),
-                    "-----BEGIN OPENSSH PRIVATE KEY-----\nb3Bl\n-----END OPENSSH PRIVATE KEY-----".to_string(),
+                    "-----BEGIN OPENSSH PRIVATE KEY-----\nb3Bl\n-----END OPENSSH PRIVATE KEY-----"
+                        .to_string(),
                 ],
             ),
             (

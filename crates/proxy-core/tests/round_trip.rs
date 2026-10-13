@@ -6,7 +6,7 @@
 //! placeholder once, since that's what we expect the real proxy to see
 //! when the redaction + LLM round-trip works.
 
-use proxy_core::{PlaceholderMap, redact, reverse, scan};
+use proxy_core::{redact, reverse, scan, PlaceholderMap};
 
 #[test]
 fn redact_then_reverse_restores_every_secret() {
@@ -124,8 +124,7 @@ fn reverse_on_a_response_that_drops_the_placeholder_yields_no_restoration() {
 fn redact_handles_byte_offsets_in_utf8_text_correctly() {
     // Mixed-script prompts (em-dash, smart quotes, non-ASCII names)
     // exercise the byte-vs-char distinction in the substitute loop.
-    let prompt =
-        "В моём .env: AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE — пожалуйста, посмотри.";
+    let prompt = "В моём .env: AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE — пожалуйста, посмотри.";
     let mut map = PlaceholderMap::new();
     let redacted = redact(prompt, &mut map);
     assert!(redacted.starts_with("В моём .env: AWS_ACCESS_KEY_ID="));
@@ -133,7 +132,10 @@ fn redact_handles_byte_offsets_in_utf8_text_correctly() {
     assert!(redacted.ends_with(" — пожалуйста, посмотри."));
     // Reverse round-trip:
     let response = "\u{ab}SECRET_AWS_KEY_001\u{bb} — это твой ключ.";
-    assert_eq!(reverse(response, &map), "AKIAIOSFODNN7EXAMPLE — это твой ключ.");
+    assert_eq!(
+        reverse(response, &map),
+        "AKIAIOSFODNN7EXAMPLE — это твой ключ."
+    );
 }
 
 #[test]
@@ -147,7 +149,12 @@ fn round_trip_recovers_gcp_service_account_json_blob() {
     let prompt = format!("Deploy with this key: {blob}\nThen run.");
     let mut map = PlaceholderMap::new();
     let redacted = redact(&prompt, &mut map);
-    assert_eq!(map.len(), 1, "expected one placeholder for the GCP blob, got {}", map.len());
+    assert_eq!(
+        map.len(),
+        1,
+        "expected one placeholder for the GCP blob, got {}",
+        map.len()
+    );
     assert!(
         redacted.contains("\u{ab}SECRET_GCP_SA_JSON_001\u{bb}"),
         "missing GCP placeholder: {redacted:?}",
@@ -178,7 +185,12 @@ fn gcp_round_trip_nested_object_form() {
     let prompt = format!("Deploy with: {blob}\nThen run.");
     let mut map = PlaceholderMap::new();
     let redacted = redact(&prompt, &mut map);
-    assert_eq!(map.len(), 1, "expected one placeholder for the nested GCP blob, got {}", map.len());
+    assert_eq!(
+        map.len(),
+        1,
+        "expected one placeholder for the nested GCP blob, got {}",
+        map.len()
+    );
     assert!(
         redacted.contains("\u{ab}SECRET_GCP_SA_JSON_001\u{bb}"),
         "missing GCP placeholder: {redacted:?}",

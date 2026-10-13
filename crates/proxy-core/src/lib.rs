@@ -41,7 +41,7 @@ pub use reverse::reverse;
 pub use rules::SecretKind;
 pub use sse::SseReverser;
 pub use system_prompt::{
-    InjectionShape, PRESERVE_TOKENS_PROMPT, inject_anthropic, inject_openai, inject_responses,
+    inject_anthropic, inject_openai, inject_responses, InjectionShape, PRESERVE_TOKENS_PROMPT,
 };
 
 /// One detected secret. Byte offsets are into the original `&str` passed

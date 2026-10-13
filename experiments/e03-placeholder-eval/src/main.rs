@@ -16,9 +16,10 @@ use anyhow::{Context, Result};
 use clap::Parser;
 
 use e03_placeholder_eval::{
-    PlaceholderFormat, load_fixtures, model::Model,
+    load_fixtures,
+    model::Model,
     providers::{anthropic::AnthropicProvider, openai::OpenAiProvider},
-    run_loop,
+    run_loop, PlaceholderFormat,
 };
 
 #[derive(Debug, Parser)]
@@ -57,8 +58,7 @@ struct Args {
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
 

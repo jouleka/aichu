@@ -45,7 +45,11 @@ async fn proxy_relays_sse_stream_and_logs_request() -> Result<()> {
         .send()
         .await?;
 
-    assert_eq!(resp.status(), 200, "upstream should respond 200 through proxy");
+    assert_eq!(
+        resp.status(),
+        200,
+        "upstream should respond 200 through proxy"
+    );
 
     let ct = resp
         .headers()
